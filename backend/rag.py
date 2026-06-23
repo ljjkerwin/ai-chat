@@ -9,7 +9,7 @@ import httpx
 import numpy as np
 from openai import AsyncOpenAI
 
-from .db import get_conn
+from db import get_conn
 
 # ── Text chunking ─────────────────────────────────────────────────────────
 

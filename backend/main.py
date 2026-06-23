@@ -9,12 +9,12 @@ from fastapi.responses import StreamingResponse
 from openai import AsyncOpenAI
 from pydantic import BaseModel
 
-from .db import (
+from db import (
     delete_document_by_id, get_all_documents, get_stats, init_db,
     create_session, get_sessions, get_session_messages,
     add_session_message, delete_session_by_id,
 )
-from .rag import add_document, search_knowledge
+from rag import add_document, search_knowledge
 
 # Load env from project root's .env.local
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "..", ".env.local"))
