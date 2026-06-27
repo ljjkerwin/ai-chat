@@ -66,7 +66,8 @@ EMBEDDING_MODEL=BAAI/bge-m3
 **后端**（端口 8000）：
 
 ```bash
-backend/.venv/bin/uvicorn main:app --reload --port 8000
+cd backend
+.venv/bin/uvicorn main:app --reload --port 8000
 ```
 
 **前端**（端口 3000）：

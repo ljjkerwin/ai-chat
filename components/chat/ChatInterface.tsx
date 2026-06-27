@@ -103,7 +103,7 @@ export default function ChatInterface() {
   }
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
+    if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
       e.preventDefault()
       handleSubmit(e as unknown as FormEvent)
     }
@@ -121,12 +121,12 @@ export default function ChatInterface() {
       <header className="flex items-center justify-between px-6 py-3.5 bg-white border-b border-gray-200 shrink-0">
         <div className="flex items-center gap-2">
           <h1 className="font-semibold text-gray-900">AI 聊天</h1>
-          {ragEnabled && (
+          {/* {ragEnabled && (
             <span className="flex items-center gap-1 text-xs bg-amber-100 text-amber-700 px-2 py-0.5 rounded-full font-medium">
               <Zap className="w-3 h-3" />
               RAG 已开启
             </span>
-          )}
+          )} */}
         </div>
         {messages.length > 0 && (
           <button
@@ -191,8 +191,8 @@ export default function ChatInterface() {
 
       {/* Input */}
       <div className="shrink-0 border-t border-gray-200 bg-white px-4 py-3">
-        <form onSubmit={handleSubmit} className="flex gap-2 items-end">
-          <div className="flex-1 relative">
+        <form onSubmit={handleSubmit} className="flex gap-2 items-center">
+          <div className="flex-1 relative flex">
             <textarea
               ref={textareaRef}
               value={input}
@@ -201,7 +201,7 @@ export default function ChatInterface() {
               placeholder={ragEnabled ? '输入问题（将参考知识库）…' : '输入消息…'}
               rows={1}
               className={cn(
-                'w-full resize-none rounded-xl border border-gray-200 bg-gray-50 px-4 py-3 pr-12',
+                'w-full resize-none rounded-xl border border-gray-200 bg-gray-50 px-4 py-3 pr-12 no-scrollbar',
                 'text-sm placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent',
                 'transition-colors'
               )}

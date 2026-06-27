@@ -1,12 +1,14 @@
 import re
 import json
 import os
+import math
 import asyncio
 from uuid import uuid4
 from typing import Optional
 
 import httpx
 import numpy as np
+import jieba
 from openai import AsyncOpenAI
 
 from db import get_conn
@@ -44,28 +46,76 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
     return float(np.dot(va, vb) / denom) if denom else 0.0
 
 
-# ── Keyword search (BM25-style fallback) ──────────────────────────────────
+# ── Keyword search (Jieba + Okapi BM25) ───────────────────────────────────
+# 关键词检索（使用 jieba 分词与 Okapi BM25 算法的兜底检索逻辑）
+
+# 基础中英文停用词表，过滤常见高频无实际语义的词
+STOPWORDS = {
+    "的", "了", "在", "是", "我", "有", "和", "人", "这", "中", "大", "来", "上", "国", "个", "到", "说", "们",
+    "a", "an", "the", "and", "or", "but", "if", "then", "of", "to", "in", "on", "at", "for", "with", "by", "about"
+}
 
 
-def _tokenize(text: str) -> set[str]:
-    text = text.lower()
-    tokens: set[str] = set()
-    # Latin/digit words (keep as units, e.g. "yahoteam", "2024")
-    for m in re.finditer(r"[a-z0-9_]{2,}", text):
-        tokens.add(m.group())
-    # CJK: individual chars + bigrams for better recall
-    cjk = re.findall(r"[一-鿿㐀-䶿]", text)
-    tokens.update(cjk)
-    tokens.update(cjk[i] + cjk[i + 1] for i in range(len(cjk) - 1))
+def _tokenize(text: str, filter_stopwords: bool = True) -> list[str]:  # 定义内部的分词函数，返回分词列表（保留词频）
+    # 使用 jieba 进行精确分词并转为小写
+    raw_tokens = jieba.lcut(text.lower())
+    # 过滤掉空白字符与纯符号
+    tokens = [t.strip() for t in raw_tokens if t.strip()]
+    if filter_stopwords:
+        filtered = [t for t in tokens if t not in STOPWORDS]
+        # 如果过滤停用词后没有剩任何词，就用未过滤的分词以防止返回空结果
+        if filtered:
+            return filtered
     return tokens
 
 
-def keyword_score(query: str, chunk: str) -> float:
-    q_tokens = _tokenize(query)
-    if not q_tokens:
-        return 0.0
-    c_tokens = _tokenize(chunk)
-    return len(q_tokens & c_tokens) / len(q_tokens)
+class BM25:
+    """轻量级自包含的 Okapi BM25 算法实现，用于关键词算分。"""
+    def __init__(self, corpus: list[list[str]], k1: float = 1.5, b: float = 0.75):
+        self.k1 = k1  # 词频饱和度控制参数，通常介于 1.2 和 2.0 之间
+        self.b = b  # 文档长度惩罚参数，通常为 0.75
+        self.corpus_size = len(corpus)  # 语料库中文档（分块）总数
+        # 计算语料库平均文档长度
+        self.avgdl = sum(len(doc) for doc in corpus) / self.corpus_size if self.corpus_size > 0 else 0
+        
+        # 计算每个词在语料库中的文档频率 DF (Document Frequency)
+        self.doc_freqs = {}
+        for doc in corpus:
+            seen = set(doc)
+            for word in seen:
+                self.doc_freqs[word] = self.doc_freqs.get(word, 0) + 1
+                
+        # 预计算每个词的逆文档频率 IDF (Inverse Document Frequency)
+        self.idf = {}
+        for word, df in self.doc_freqs.items():
+            # 使用标准的 BM25 IDF 公式，对数中加 1 保证 IDF 恒大于 0
+            self.idf[word] = math.log((self.corpus_size - df + 0.5) / (df + 0.5) + 1.0)
+
+    def get_score(self, query_tokens: list[str], doc_tokens: list[str]) -> float:
+        """计算给定查询分词与文档分词之间的 BM25 得分。"""
+        score = 0.0
+        doc_len = len(doc_tokens)
+        if doc_len == 0:
+            return 0.0
+            
+        # 计算该文档中每个词的词频 TF (Term Frequency)
+        doc_tf = {}
+        for word in doc_tokens:
+            doc_tf[word] = doc_tf.get(word, 0) + 1
+            
+        # 累加查询中每个词在当前文档的得分
+        for word in query_tokens:
+            if word not in doc_tf:
+                continue
+            tf = doc_tf[word]
+            idf = self.idf.get(word, 0.0)
+            
+            # BM25 词频归一化公式
+            numerator = tf * (self.k1 + 1)
+            denominator = tf + self.k1 * (1.0 - self.b + self.b * (doc_len / self.avgdl))
+            score += idf * (numerator / denominator)
+            
+        return score
 
 
 # ── Embedding ─────────────────────────────────────────────────────────────
@@ -157,13 +207,19 @@ async def search_knowledge(query: str, top_k: int = 4) -> dict:
         if not docs:
             return {"context": "", "sources": []}
         query_emb = await get_embedding(query)
+        
+        # 初始化 BM25 计算文档得分
+        corpus_tokens = [_tokenize(d["content"]) for d in docs]
+        bm25 = BM25(corpus_tokens)
+        q_tokens = _tokenize(query)
+
         scored_docs = []
-        for d in docs:
+        for i, d in enumerate(docs):
             if query_emb:
                 doc_emb = await get_embedding(d["content"])
-                score = cosine_similarity(query_emb, doc_emb) if doc_emb else keyword_score(query, d["content"])
+                score = cosine_similarity(query_emb, doc_emb) if doc_emb else bm25.get_score(q_tokens, corpus_tokens[i])
             else:
-                score = keyword_score(query, d["content"])
+                score = bm25.get_score(q_tokens, corpus_tokens[i])
             scored_docs.append((score, d))
         scored_docs.sort(key=lambda x: x[0], reverse=True)
         top_docs = [(s, d) for s, d in scored_docs[:top_k] if s > 0.05]
@@ -187,12 +243,17 @@ async def search_knowledge(query: str, top_k: int = 4) -> dict:
     has_embeddings = any(r["embedding"] for r in rows)
     query_emb = await get_embedding(query) if has_embeddings else None
 
+    # 初始化 BM25 计算分块得分
+    corpus_tokens = [_tokenize(r["content"]) for r in rows]
+    bm25 = BM25(corpus_tokens)
+    q_tokens = _tokenize(query)
+
     scored = []
-    for r in rows:
+    for i, r in enumerate(rows):
         if query_emb and r["embedding"]:
             score = cosine_similarity(query_emb, json.loads(r["embedding"]))
         else:
-            score = keyword_score(query, r["content"])
+            score = bm25.get_score(q_tokens, corpus_tokens[i])
         scored.append((score, r))
 
     scored.sort(key=lambda x: x[0], reverse=True)
