@@ -9,7 +9,7 @@ import MessageItem from './MessageItem'
 import { cn } from '@/lib/utils'
 
 export default function ChatInterface() {
-  const { ragEnabled } = useRAG()
+  const { ragEnabled, kbId } = useRAG()
   const {
     currentSessionId,
     setCurrentSessionId,
@@ -99,7 +99,7 @@ export default function ChatInterface() {
   const handleSubmit = (e: FormEvent) => {
     e.preventDefault()
     if (!input.trim() || isLoading) return
-    originalHandleSubmit(e, { body: { ragEnabled, sessionId: currentSessionId } })
+    originalHandleSubmit(e, { body: { ragEnabled, sessionId: currentSessionId, kbId } })
   }
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {

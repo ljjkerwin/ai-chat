@@ -1,70 +1,236 @@
 'use client'
 
 import { useState, useEffect, useCallback } from 'react'
-import { BookOpen, Plus, Trash2, FileText, Hash, Calendar, ChevronDown, ChevronUp, Loader2 } from 'lucide-react'
+import { BookOpen, Plus, Trash2, FileText, Hash, Calendar, ChevronDown, ChevronUp, Loader2, FolderKanban } from 'lucide-react'
 import { cn, formatDate, truncate } from '@/lib/utils'
 import type { KnowledgeDocument, KBStats } from '@/types'
+import { useRAG } from '@/contexts/RAGContext'
 
 export default function KnowledgeBase() {
+  const { kbId, setKbId, knowledgeBases, refreshKBs } = useRAG()
   const [docs, setDocs] = useState<KnowledgeDocument[]>([])
   const [stats, setStats] = useState<KBStats>({ docCount: 0, chunkCount: 0 })
   const [showForm, setShowForm] = useState(false)
   const [loading, setLoading] = useState(true)
+  const [showKbForm, setShowKbForm] = useState(false)
+  const [newKbName, setNewKbName] = useState('')
+  const [newKbDesc, setNewKbDesc] = useState('')
+  const [creatingKb, setCreatingKb] = useState(false)
+  const [kbError, setKbError] = useState('')
+
+  const activeKb = knowledgeBases.find(k => k.id === kbId) || knowledgeBases[0]
 
   const fetchDocs = useCallback(async () => {
-    const res = await fetch('/api/knowledge')
-    const data = await res.json()
-    setDocs(data.documents)
-    setStats(data.stats)
-    setLoading(false)
-  }, [])
+    if (!kbId) return
+    setLoading(true)
+    try {
+      const res = await fetch(`/api/knowledge?kb_id=${kbId}`)
+      const data = await res.json()
+      setDocs(data.documents ?? [])
+      setStats(data.stats ?? { docCount: 0, chunkCount: 0 })
+    } catch (e) {
+      console.error('[KB] Failed to fetch documents:', e)
+    } finally {
+      setLoading(false)
+    }
+  }, [kbId])
 
-  useEffect(() => { fetchDocs() }, [fetchDocs])
+  useEffect(() => {
+    if (kbId) {
+      fetchDocs()
+    }
+  }, [kbId, fetchDocs])
+
+  const handleCreateKb = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!newKbName.trim()) {
+      setKbError('名称不能为空')
+      return
+    }
+    setCreatingKb(true)
+    setKbError('')
+    try {
+      const res = await fetch('/api/knowledge-bases', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: newKbName.trim(), description: newKbDesc.trim() }),
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.detail || '创建失败')
+      setNewKbName('')
+      setNewKbDesc('')
+      setShowKbForm(false)
+      await refreshKBs()
+      if (data.id) {
+        setKbId(data.id)
+      }
+    } catch (err) {
+      setKbError((err as Error).message)
+    } finally {
+      setCreatingKb(false)
+    }
+  }
+
+  const handleDeleteKb = async (e: React.MouseEvent, id: string, name: string) => {
+    e.stopPropagation()
+    if (id === '1') {
+      alert('系统默认知识库无法删除')
+      return
+    }
+    if (!confirm(`确认删除整个知识库「${name}」？此操作将级联删除该知识库下的所有文档及其向量数据，不可恢复！`)) return
+
+    try {
+      const res = await fetch(`/api/knowledge-bases/${id}`, { method: 'DELETE' })
+      if (!res.ok) throw new Error('删除失败')
+      await refreshKBs()
+      if (kbId === id) {
+        setKbId('1')
+      }
+    } catch (err) {
+      alert((err as Error).message)
+    }
+  }
 
   return (
-    <div className="flex flex-col h-full">
-      {/* Header */}
-      <header className="flex items-center justify-between px-6 py-3.5 bg-white border-b border-gray-200 shrink-0">
-        <div className="flex items-center gap-2">
-          <h1 className="font-semibold text-gray-900">知识库</h1>
-          <span className="text-xs bg-gray-100 text-gray-600 px-2 py-0.5 rounded-full">
-            {stats.docCount} 篇 · {stats.chunkCount} 片段
-          </span>
+    <div className="flex h-full bg-gray-50 overflow-hidden">
+      {/* Left Column: KB list */}
+      <div className="w-64 shrink-0 bg-white border-r border-gray-200 flex flex-col h-full">
+        <div className="p-4 border-b border-gray-100 flex items-center justify-between shrink-0">
+          <h2 className="font-semibold text-gray-800 text-sm flex items-center gap-1.5">
+            <FolderKanban className="w-4 h-4 text-blue-600" />
+            知识库列表
+          </h2>
+          <button
+            onClick={() => setShowKbForm(v => !v)}
+            className="p-1 hover:bg-gray-100 rounded text-blue-600 hover:text-blue-700 transition-colors"
+            title="新建知识库"
+          >
+            <Plus className="w-4 h-4" />
+          </button>
         </div>
-        <button
-          onClick={() => setShowForm(v => !v)}
-          className="flex items-center gap-1.5 text-sm bg-blue-600 text-white px-3 py-1.5 rounded-lg hover:bg-blue-700 transition-colors"
-        >
-          <Plus className="w-4 h-4" />
-          添加文档
-        </button>
-      </header>
 
-      <div className="flex-1 overflow-y-auto p-6 space-y-4">
-        {/* Upload form */}
-        {showForm && (
-          <UploadForm
-            onSuccess={() => { setShowForm(false); fetchDocs() }}
-            onCancel={() => setShowForm(false)}
-          />
-        )}
-
-        {/* Document list */}
-        {loading ? (
-          <div className="flex items-center justify-center py-20">
-            <Loader2 className="w-6 h-6 animate-spin text-gray-400" />
-          </div>
-        ) : docs.length === 0 && !showForm ? (
-          <EmptyKB onAdd={() => setShowForm(true)} />
-        ) : (
-          docs.map(doc => (
-            <DocCard
-              key={doc.id}
-              doc={doc}
-              onDelete={() => fetchDocs()}
+        {/* KB Creation Form */}
+        {showKbForm && (
+          <form onSubmit={handleCreateKb} className="p-3 bg-blue-50 border-b border-blue-100 shrink-0 space-y-2.5">
+            <div className="text-xs font-semibold text-blue-800">新建知识库</div>
+            <input
+              type="text"
+              placeholder="知识库名称..."
+              value={newKbName}
+              onChange={e => setNewKbName(e.target.value)}
+              className="w-full text-xs border border-gray-200 rounded px-2 py-1.5 focus:outline-none focus:ring-1 focus:ring-blue-500 bg-white"
             />
-          ))
+            <input
+              type="text"
+              placeholder="描述信息（可选）..."
+              value={newKbDesc}
+              onChange={e => setNewKbDesc(e.target.value)}
+              className="w-full text-xs border border-gray-200 rounded px-2 py-1.5 focus:outline-none focus:ring-1 focus:ring-blue-500 bg-white"
+            />
+            {kbError && <p className="text-[10px] text-red-600">{kbError}</p>}
+            <div className="flex gap-1.5">
+              <button
+                type="submit"
+                disabled={creatingKb}
+                className="text-[10px] bg-blue-600 text-white rounded px-2.5 py-1 hover:bg-blue-700 disabled:bg-blue-400 font-medium"
+              >
+                {creatingKb ? '创建中...' : '确定'}
+              </button>
+              <button
+                type="button"
+                onClick={() => { setShowKbForm(false); setKbError('') }}
+                className="text-[10px] bg-white border border-gray-200 text-gray-600 rounded px-2.5 py-1 hover:bg-gray-50"
+              >
+                取消
+              </button>
+            </div>
+          </form>
         )}
+
+        {/* List mapping */}
+        <div className="flex-1 overflow-y-auto p-2 space-y-1">
+          {knowledgeBases.map(kb => {
+            const isActive = kb.id === kbId
+            return (
+              <div
+                key={kb.id}
+                onClick={() => { setKbId(kb.id); setShowForm(false) }}
+                className={cn(
+                  'group flex items-center justify-between p-2.5 rounded-lg cursor-pointer transition-colors relative',
+                  isActive ? 'bg-blue-50 text-blue-700' : 'hover:bg-gray-50 text-gray-700'
+                )}
+              >
+                <div className="min-w-0 pr-6">
+                  <p className="text-xs font-semibold truncate">{kb.name}</p>
+                  <p className="text-[10px] text-gray-400 truncate mt-0.5">
+                    {kb.description || '暂无描述'}
+                  </p>
+                  <p className="text-[9px] text-gray-400 mt-1">
+                    {kb.docCount ?? 0} 文档 · {kb.chunkCount ?? 0} 片段
+                  </p>
+                </div>
+                {kb.id !== '1' && (
+                  <button
+                    onClick={e => handleDeleteKb(e, kb.id, kb.name)}
+                    className="absolute right-2 opacity-0 group-hover:opacity-100 hover:text-red-500 text-gray-400 transition-all p-1"
+                    title="删除知识库"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                  </button>
+                )}
+              </div>
+            )
+          })}
+        </div>
+      </div>
+
+      {/* Right Column: Doc list for active KB */}
+      <div className="flex-1 flex flex-col h-full bg-white overflow-hidden">
+        {/* Header */}
+        <header className="flex items-center justify-between px-6 py-3.5 bg-white border-b border-gray-200 shrink-0">
+          <div className="flex items-center gap-2">
+            <h1 className="font-semibold text-gray-900">{activeKb?.name || '加载中...'}</h1>
+            <span className="text-xs bg-gray-100 text-gray-600 px-2 py-0.5 rounded-full">
+              {stats.docCount} 篇 · {stats.chunkCount} 片段
+            </span>
+          </div>
+          <button
+            onClick={() => setShowForm(v => !v)}
+            disabled={!kbId}
+            className="flex items-center gap-1.5 text-sm bg-blue-600 text-white px-3 py-1.5 rounded-lg hover:bg-blue-700 transition-colors disabled:opacity-50"
+          >
+            <Plus className="w-4 h-4" />
+            添加文档
+          </button>
+        </header>
+
+        <div className="flex-1 overflow-y-auto p-6 space-y-4 bg-gray-50">
+          {/* Upload form */}
+          {showForm && kbId && (
+            <UploadForm
+              kbId={kbId}
+              onSuccess={() => { setShowForm(false); fetchDocs(); refreshKBs() }}
+              onCancel={() => setShowForm(false)}
+            />
+          )}
+
+          {/* Document list */}
+          {loading ? (
+            <div className="flex items-center justify-center py-20">
+              <Loader2 className="w-6 h-6 animate-spin text-gray-400" />
+            </div>
+          ) : docs.length === 0 && !showForm ? (
+            <EmptyKB onAdd={() => setShowForm(true)} />
+          ) : (
+            docs.map(doc => (
+              <DocCard
+                key={doc.id}
+                doc={doc}
+                onDelete={() => { fetchDocs(); refreshKBs() }}
+              />
+            ))
+          )}
+        </div>
       </div>
     </div>
   )
@@ -72,7 +238,7 @@ export default function KnowledgeBase() {
 
 // ── Upload Form ─────────────────────────────────────────────────────────────
 
-function UploadForm({ onSuccess, onCancel }: { onSuccess: () => void; onCancel: () => void }) {
+function UploadForm({ kbId, onSuccess, onCancel }: { kbId: string; onSuccess: () => void; onCancel: () => void }) {
   const [title, setTitle] = useState('')
   const [content, setContent] = useState('')
   const [saving, setSaving] = useState(false)
@@ -91,10 +257,10 @@ function UploadForm({ onSuccess, onCancel }: { onSuccess: () => void; onCancel: 
       const res = await fetch('/api/knowledge', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title: title.trim(), content: content.trim() }),
+        body: JSON.stringify({ title: title.trim(), content: content.trim(), kbId }),
       })
       const data = await res.json()
-      if (!res.ok) throw new Error(data.error || '保存失败')
+      if (!res.ok) throw new Error(data.detail || '保存失败')
       onSuccess()
     } catch (err) {
       setError((err as Error).message)
@@ -177,8 +343,15 @@ function DocCard({ doc, onDelete }: { doc: KnowledgeDocument; onDelete: () => vo
   const handleDelete = async () => {
     if (!confirm(`确认删除「${doc.title}」？此操作不可恢复。`)) return
     setDeleting(true)
-    await fetch(`/api/knowledge/${doc.id}`, { method: 'DELETE' })
-    onDelete()
+    try {
+      const res = await fetch(`/api/knowledge/${doc.id}`, { method: 'DELETE' })
+      if (!res.ok) throw new Error('删除失败')
+      onDelete()
+    } catch (e) {
+      alert((e as Error).message)
+    } finally {
+      setDeleting(false)
+    }
   }
 
   return (

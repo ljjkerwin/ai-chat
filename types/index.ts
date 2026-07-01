@@ -7,6 +7,15 @@ export interface KnowledgeDocument {
   chunkCount?: number
 }
 
+export interface KnowledgeBase {
+  id: string
+  name: string
+  description?: string
+  createdAt: number
+  docCount?: number
+  chunkCount?: number
+}
+
 export interface Source {
   documentId: string
   documentTitle: string

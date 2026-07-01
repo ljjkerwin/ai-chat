@@ -70,13 +70,13 @@ cd backend
 .venv/bin/uvicorn main:app --reload --port 8000
 ```
 
-**前端**（端口 3000）：
+**前端**（端口 3200）：
 
 ```bash
 npm run dev
 ```
 
-打开 [http://localhost:3000](http://localhost:3000) 即可使用。
+打开 [http://localhost:3200](http://localhost:3200) 即可使用。
 
 ## 项目结构
 

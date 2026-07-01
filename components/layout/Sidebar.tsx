@@ -11,18 +11,19 @@ import type { KBStats } from '@/types'
 
 export default function Sidebar() {
   const pathname = usePathname()
-  const { ragEnabled, setRagEnabled } = useRAG()
+  const { ragEnabled, setRagEnabled, kbId, setKbId, knowledgeBases } = useRAG()
   const { sessions, reloadSessions, currentSessionId, switchSession } = useSession()
   const [stats, setStats] = useState<KBStats>({ docCount: 0, chunkCount: 0 })
 
   const isChat = pathname === '/chat'
 
   useEffect(() => {
-    fetch('/api/knowledge')
+    const activeKbId = kbId || '1'
+    fetch(`/api/knowledge?kb_id=${activeKbId}`)
       .then(r => r.json())
       .then(d => setStats(d.stats))
       .catch(() => {})
-  }, [pathname])
+  }, [pathname, kbId])
 
   useEffect(() => {
     if (isChat) reloadSessions()
@@ -146,6 +147,24 @@ export default function Sidebar() {
               ? '已开启：回复将参考知识库内容'
               : '已关闭：纯模型回复，不使用知识库'}
           </p>
+
+          {/* KB Dropdown Select */}
+          {ragEnabled && knowledgeBases.length > 0 && (
+            <div className="space-y-1 pt-1 border-t border-gray-200">
+              <label className="text-[10px] font-semibold text-gray-400 block uppercase tracking-wider">切换当前知识库</label>
+              <select
+                value={kbId || '1'}
+                onChange={e => setKbId(e.target.value)}
+                className="w-full bg-white border border-gray-200 rounded-lg px-2 py-1.5 text-xs text-gray-700 focus:outline-none focus:ring-1 focus:ring-blue-500 cursor-pointer"
+              >
+                {knowledgeBases.map(kb => (
+                  <option key={kb.id} value={kb.id}>
+                    {kb.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
 
           {/* KB Stats */}
           <div className="flex items-center gap-1.5 pt-1 border-t border-gray-200">
