@@ -6,7 +6,7 @@ import pymysql.cursors
 from dotenv import load_dotenv
 
 # Load env from project root's .env.local
-load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "..", ".env.local"))
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "..", "..", ".env.local"))
 
 
 import queue

@@ -2,13 +2,20 @@ import json
 import os
 import asyncio
 from uuid import uuid4
-from typing import Optional
+from typing import Optional, List, Dict, Any
 
 import httpx
 from openai import AsyncOpenAI
 import json;
 
-from db import get_conn
+from langchain_core.retrievers import BaseRetriever
+from langchain_core.documents import Document
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_openai import ChatOpenAI
+from langchain_core.output_parsers import StrOutputParser
+
+from services.db import get_conn
 from pymilvus import MilvusClient, DataType, AnnSearchRequest, RRFRanker, WeightedRanker
 
 _milvus_client = None
@@ -180,7 +187,7 @@ def ensure_collection(client: MilvusClient, dimension: int = 1024) -> None:
 
 def delete_document(doc_id: str, tenant_id: str) -> None:
     """Delete a document from both MySQL and Milvus."""
-    from db import delete_document_by_id
+    from services.db import delete_document_by_id
     delete_document_by_id(doc_id, tenant_id)
 
     try:
@@ -220,24 +227,12 @@ def delete_knowledge_base_vectors(kb_id: str, tenant_id: str) -> None:
 
 
 def chunk_text(text: str, chunk_size: int = 600, overlap: int = 120) -> list[str]:
-    chunks: list[str] = []
-    start = 0
-    while start < len(text):
-        end = min(start + chunk_size, len(text))
-        if end < len(text):
-            slice_text = text[start:end]
-            for br in ["。\n", "！\n", "？\n", "\n\n", "。", "！", "？", ".", "\n"]:
-                idx = slice_text.rfind(br)
-                if idx > chunk_size * 0.4:
-                    end = start + idx + len(br)
-                    break
-        chunk = text[start:end].strip()
-        if chunk:
-            chunks.append(chunk)
-        if end >= len(text):
-            break
-        start = end - overlap
-    return chunks
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=overlap,
+        separators=["。\n", "！\n", "？\n", "\n\n", "。", "！", "？", ".", "\n", " ", ""]
+    )
+    return splitter.split_text(text)
 
 
 def merge_overlapping_strings(s1: str, s2: str) -> str:
@@ -328,136 +323,37 @@ async def search_knowledge(
     query: str, 
     kb_id: str, 
     tenant_id: str, 
-    top_k: int = 4, 
-    chat_history: Optional[list[dict]] = None
+    top_k: int = 4
 ) -> dict:
     """
     RAG 知识检索核心方法。
     
     检索流程包含以下阶段：
-    1. 查询重写 (Query Rewriting)：结合历史对话上下文将多轮问答问题重写为独立的检索 query。
-    2. 向量化 (Embedding Generation)：使用 BGE-M3 模型生成密向量与稀疏向量表示。
-    3. 混合检索与排序融合 (Milvus Hybrid Search & Fusion)：利用 Milvus 支持的 Dense 与 Sparse 向量进行混合检索，
+    1. 向量化 (Embedding Generation)：使用 BGE-M3 模型生成密向量与稀疏向量表示。
+    2. 混合检索与排序融合 (Milvus Hybrid Search & Fusion)：利用 Milvus 支持的 Dense 与 Sparse 向量进行混合检索，
        并根据配置的环境变量选择 WeightedRanker (加权融合) 或 RRFRanker (互反排名融合) 进行排序融合。
-    4. 一次性元数据拉取 (Consolidated Metadata Fetch - 优化1)：一次性从 MySQL 获取候选 chunks 及其对应 documents 的元数据，
+    3. 一次性元数据拉取 (Consolidated Metadata Fetch - 优化1)：一次性从 MySQL 获取候选 chunks 及其对应 documents 的元数据，
        避免多重回表查询，降低接口 RT。
-    5. Rerank 重排管道 (Rerank Pipeline)：根据权重或分数进行 Cross-Encoder 二次精细打分。
-    6. 上下文扩展与去重拼接 (Context Merging & Deduplication - 优化3)：为 top_k chunks 批量获取邻近块，
+    4. Rerank 重排管道 (Rerank Pipeline)：根据权重或分数进行 Cross-Encoder 二次精细打分。
+    5. 上下文扩展与去重拼接 (Context Merging & Deduplication - 优化3)：为 top_k chunks 批量获取邻近块，
        对序号连续的块运用 merge_overlapping_strings 算法对 overlap 的 120 字符重叠段进行对齐去重，避免 prompt 噪音污染并节省 token 预算。
-    7. 格式化构建 (XML Output Builder)：以 XML 节点形式组织文档段落，并应用 8000 字符的硬限预算以防 token 溢出。
+    6. 格式化构建 (XML Output Builder)：以 XML 节点形式组织文档段落，并应用 8000 字符的硬限预算以防 token 溢出。
     """
     # 验证输入的安全性和格式，防止恶意的 ID 输入
     if not validate_safe_id(kb_id) or not validate_safe_id(tenant_id):
         print(f"[RAG] Invalid search identifiers: kb_id={kb_id}, tenant_id={tenant_id}")
         return {"context": "", "sources": []}
 
-    print(f"[RAG] Searching knowledge for query: {query}, kb_id: {kb_id}, tenant_id: {tenant_id}, chat_history: {len(chat_history) if chat_history else 0}")
+    print(f"[RAG] Searching knowledge for query: {query}, kb_id: {kb_id}, tenant_id: {tenant_id}")
 
-    # 1. 对话查询重写 (Query Rewriting) with Timeout
-    # 若包含历史对话，使用大语言模型补全当前 query 中可能缺失的代词或指代信息，生成独立的 Standalone 核心问题
-    search_query = query
-    if chat_history and len(chat_history) > 0:
-        try:
-            mimo_base_url = os.getenv("MIMO_BASE_URL", "https://api.siliconflow.cn/v1")
-            mimo_api_key = os.getenv("MIMO_API_KEY", "")
-            mimo_model = os.getenv("MIMO_MODEL", "Xiaomi/MiMo-7B-RL")
-            
-            if mimo_api_key:
-                # 仅保留最近 5 轮对话以平衡性能和成本
-                history_slice = chat_history[-5:]
-                formatted_history = ""
-                for msg in history_slice:
-                    role_str = "用户" if msg.get("role") == "user" else "助手"
-                    content_str = msg.get("content", "")
-                    formatted_history += f"{role_str}: {content_str}\n"
-                
-                # 引导 LLM 生成最契合知识检索的问题
-                rewrite_prompt = f"""你是一个智能检索助手。请结合以下对话历史和用户最新的问题，生成一个最适合用来检索知识库的核心问题（Standalone Search Query）。
-这个核心问题应当：
-1. 包含历史上下文中必要的实体、名词以及指代词指向的具体对象（补全省略信息）；
-2. 保持简洁，去除多余的问候语或解释性文字；
-3. 直接输出这个独立的核心问题，不要包含任何多余的前言、解释或标记。
-4. 如果是某些领域的专有名词，则原路返回这个名词
-5. 如果是一些打招呼、感谢语、感叹语之类的不需要检索知识库的语句，直接返回：None
-
-【示例一】
-对话历史：
-用户：贵州茅台最新的财报怎么样？
-助手：贵州茅台2024年年报显示营收同比增长15%，净利润创历史新高。
-用户最新的问题：它的分红政策呢？
-核心问题：贵州茅台的分红政策
-
-【示例二】
-对话历史：
-用户：什么是市盈率？
-助手：市盈率（PE）是股价除以每股收益，反映投资者为每单位收益愿意支付的价格。
-用户最新的问题：你好
-核心问题：None
-
-【示例三】
-用户最新的问题：No.23214
-核心问题：No.23214
-
-【对话历史】
-{formatted_history}
-
-【用户最新的问题】
-{query}
-
-【核心问题】"""
-
-                client = get_openai_client(mimo_base_url, mimo_api_key)
-                # 使用 wait_for 设定 2.5 秒超时防止影响聊天响应流畅度
-                print("requesting rewrite query...")
-                response = await asyncio.wait_for(
-                    client.chat.completions.create(
-                        model=mimo_model,
-                        messages=[{"role": "user", "content": rewrite_prompt}],
-                        temperature=0.3,
-                        max_tokens=1024  # MiMo 等推理模型需要为 <think>思考链</think> 预留足够空间，实际答案本身很短
-                    ),
-                    timeout=30
-                )
-
-                rewritten = None
-                if response and response.choices and len(response.choices) > 0:
-                    message = response.choices[0].message
-                    if message and message.content:
-                        rewritten = message.content.strip()
-
-                print(f"[RAG STEP 1]{rewritten}")
-
-                # 对思考型推理大模型的输出进行后处理，提取并过滤掉思考标签
-                if rewritten:
-                    if "<think>" in rewritten:
-                        if "</think>" in rewritten:
-                            rewritten = rewritten.split("</think>")[-1].strip()
-                        else:
-                            rewritten = rewritten.split("<think>")[0].strip()
-
-                    rewritten = rewritten.strip('"\'\'`').strip()
-                    if rewritten and len(rewritten) < 100:
-                        print(f"Rewrite query: '{query}' -> '{rewritten}'")
-                        search_query = rewritten
-                    else:
-                        # 重写后为空或过长，视为无明确检索意图，跳过知识库搜索
-                        print(f"[RAG] Rewritten query empty or too long, skipping knowledge search.")
-                        return {"context": "", "sources": []}
-                else:
-                    # rewritten 为 None，LLM 显式判断无明确问题（如闲聊），跳过知识库搜索
-                    print(f"[RAG] Query rewriting returned None (no retrieval intent), skipping knowledge search.")
-                    return {"context": "", "sources": []}
-        except Exception as e:
-            print(f"[RAG] Query rewriting bypassed or timed out: {e}")
-
-    # 2. 向量化查询 (Embedding Generation)
+    # 1. 向量化查询 (Embedding Generation)
     # 利用 BGE-M3 生成密集和稀疏特征表示
     try:
         bge_m3 = get_bge_m3_client()
-        res = await asyncio.to_thread(bge_m3, [search_query])
+        res = await asyncio.to_thread(bge_m3, [query])
         query_emb = res["dense"][0].tolist()
         query_sparse = sparse_to_dict(res["sparse"][0])
-        print(f"[RAG STEP 2] dense and sparse convert: {search_query}")
+        print(f"[RAG STEP 2] dense and sparse convert: {query}")
         # print(query_emb)
         # print(query_sparse)
     except Exception as e:
@@ -626,7 +522,7 @@ async def search_knowledge(
                                     }
                                     body = {
                                         "model": reranker_model,
-                                        "query": search_query,
+                                        "query": query,
                                         "documents": [c["content"] for c in candidate_chunks],
                                         "top_n": top_k
                                     }
@@ -729,7 +625,7 @@ async def search_knowledge(
                             content_by_index[(d_id, idx)] = content
 
                         print(f"[RAG STEP 6] final enhanced doc: {len(content_by_index)}")
-                        print(json.dumps({f"{k[0]}:{k[1]}": v for k, v in content_by_index.items()}, ensure_ascii=False, indent=2))
+                        # print(json.dumps({f"{k[0]}:{k[1]}": v for k, v in content_by_index.items()}, ensure_ascii=False, indent=2))
 
                         # 初始化返回的数据源列表，用于返回给前端或调用方
                         sources = []
@@ -847,3 +743,27 @@ async def search_knowledge(
 
     # 如果无法生成查询的向量，或者搜索过程中发生异常/无结果，返回默认的空上下文和空数据源字典
     return {"context": "", "sources": []}
+
+
+class RAGRetriever(BaseRetriever):
+    kb_id: str
+    tenant_id: str
+    top_k: int = 5
+
+    def _get_relevant_documents(self, query: str) -> List[Document]:
+        raise NotImplementedError("Use aget_relevant_documents for async search")
+
+    async def _aget_relevant_documents(self, query: str) -> List[Document]:
+        res = await search_knowledge(
+            query=query,
+            kb_id=self.kb_id,
+            tenant_id=self.tenant_id,
+            top_k=self.top_k
+        )
+        return [
+            Document(
+                page_content=res["context"],
+                metadata={"sources": res["sources"]}
+            )
+        ]
+
