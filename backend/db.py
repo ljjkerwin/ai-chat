@@ -9,21 +9,70 @@ from dotenv import load_dotenv
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "..", ".env.local"))
 
 
-def get_conn():
+import queue
+from contextlib import contextmanager
+
+_db_pool = None
+
+def init_pool():
+    global _db_pool
+    if _db_pool is not None:
+        return
     host = os.getenv("MYSQL_HOST")
     user = os.getenv("MYSQL_USERNAME")
     password = os.getenv("MYSQL_PASSWORD")
     database = os.getenv("MYSQL_DATABASE", "rag")
 
-    conn = pymysql.connect(
-        host=host,
-        user=user,
-        password=password,
-        database=database,
-        cursorclass=pymysql.cursors.DictCursor,
-        autocommit=True
-    )
-    return conn
+    config = {
+        "host": host,
+        "user": user,
+        "password": password,
+        "database": database,
+        "cursorclass": pymysql.cursors.DictCursor,
+        "autocommit": True
+    }
+
+    class SimplePool:
+        def __init__(self, size=15, **conn_kwargs):
+            self.conn_kwargs = conn_kwargs
+            self.queue = queue.Queue(maxsize=size)
+            for _ in range(size):
+                self.queue.put(self.create_conn())
+
+        def create_conn(self):
+            return pymysql.connect(**self.conn_kwargs)
+
+        def get(self):
+            try:
+                conn = self.queue.get(timeout=5)
+                try:
+                    conn.ping(reconnect=True)
+                except Exception:
+                    conn = self.create_conn()
+                return conn
+            except queue.Empty:
+                return self.create_conn()
+
+        def put(self, conn):
+            try:
+                self.queue.put_nowait(conn)
+            except queue.Full:
+                conn.close()
+
+    _db_pool = SimplePool(size=15, **config)
+
+
+@contextmanager
+def get_conn():
+    global _db_pool
+    if _db_pool is None:
+        init_pool()
+    conn = _db_pool.get()
+    try:
+        yield conn
+    finally:
+        _db_pool.put(conn)
+
 
 
 def init_db() -> None:
@@ -145,7 +194,7 @@ def init_db() -> None:
 
 
 def initialize_incremental_stats() -> None:
-    """Initialize incremental BM25 statistics if not already initialized."""
+    """Initialize incremental statistics (simplified for BGE-M3, no BM25 term_df needed)."""
     with get_conn() as conn:
         with conn.cursor() as cursor:
             # Check if already initialized
@@ -154,44 +203,15 @@ def initialize_incremental_stats() -> None:
             if row and row["value"] == "true":
                 return
             
-            print("[DB] Initializing incremental BM25 statistics from existing chunks...")
-            # If not initialized, fetch all chunks to build stats
-            cursor.execute("SELECT content FROM chunks")
-            rows = cursor.fetchall()
-            
-            # Use lazy import to avoid circular dependency
-            from rag import tokenize
-            
-            # Calculate stats
-            term_counts = {}
-            total_tokens = 0
-            for r in rows:
-                tokens = tokenize(r["content"])
-                total_tokens += len(tokens)
-                for token in set(tokens):
-                    term_counts[token] = term_counts.get(token, 0) + 1
-            
+            print("[DB] Initializing RAG metadata...")
             # Clear any existing data just in case
             cursor.execute("TRUNCATE TABLE term_df")
             cursor.execute("TRUNCATE TABLE rag_metadata")
             
-            # Insert term frequencies in batches of 500
-            terms_data = [(term, df) for term, df in term_counts.items()]
-            batch_size = 500
-            for i in range(0, len(terms_data), batch_size):
-                batch = terms_data[i : i + batch_size]
-                cursor.executemany(
-                    "INSERT INTO term_df (term, df) VALUES (%s, %s) "
-                    "ON DUPLICATE KEY UPDATE df = VALUES(df)",
-                    batch
-                )
-            
-            # Insert metadata
-            cursor.execute("INSERT INTO rag_metadata (`key`, `value`) VALUES (%s, %s)", ("total_chunks", str(len(rows))))
-            cursor.execute("INSERT INTO rag_metadata (`key`, `value`) VALUES (%s, %s)", ("total_tokens", str(total_tokens)))
+            # Insert initialized metadata
             cursor.execute("INSERT INTO rag_metadata (`key`, `value`) VALUES (%s, %s)", ("initialized", "true"))
             
-            print(f"[DB] Initialized BM25 stats: {len(rows)} chunks, {len(term_counts)} unique terms, {total_tokens} total tokens.")
+            print("[DB] Initialized RAG metadata.")
 
 
 def create_knowledge_base(kb_id: str, name: str, description: str, tenant_id: str) -> None:

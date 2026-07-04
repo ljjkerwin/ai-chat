@@ -1,19 +1,41 @@
 import json
 import os
-import math
-import zlib
 import asyncio
 from uuid import uuid4
 from typing import Optional
 
 import httpx
-import jieba
 from openai import AsyncOpenAI
+import json;
 
 from db import get_conn
-from pymilvus import MilvusClient, DataType, AnnSearchRequest, RRFRanker
+from pymilvus import MilvusClient, DataType, AnnSearchRequest, RRFRanker, WeightedRanker
 
 _milvus_client = None
+_http_client = None
+_openai_client = None
+_checked_collections = set()
+
+def get_openai_client(base_url: str, api_key: str) -> AsyncOpenAI:
+    global _openai_client
+    if _openai_client is None:
+        _openai_client = AsyncOpenAI(base_url=base_url, api_key=api_key)
+    elif str(_openai_client.base_url).rstrip("/") != base_url.rstrip("/") or _openai_client.api_key != api_key:
+        _openai_client = AsyncOpenAI(base_url=base_url, api_key=api_key)
+    return _openai_client
+
+def get_http_client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None:
+        _http_client = httpx.AsyncClient(timeout=15)
+    return _http_client
+
+
+async def close_http_client() -> None:
+    global _http_client
+    if _http_client is not None:
+        await _http_client.aclose()
+        _http_client = None
 
 import re
 
@@ -31,253 +53,61 @@ def get_milvus_client() -> MilvusClient:
     return _milvus_client
 
 
-# ── BM25 / Sparse Vector Encoder ──────────────────────────────────────────
+# ── BGE-M3 / Sparse Vector Encoder ────────────────────────────────────────
 
-STOPWORDS = {
-    "的", "了", "在", "是", "我", "有", "和", "人", "这", "中", "大", "来", "上", "国", "个", "到", "说", "们",
-    "a", "an", "the", "and", "or", "but", "if", "then", "of", "to", "in", "on", "at", "for", "with", "by", "about"
-}
+from pymilvus.model.hybrid import BGEM3EmbeddingFunction
 
-def tokenize(text: str) -> list[str]:
-    raw_tokens = jieba.lcut(text.lower())
-    return [t.strip() for t in raw_tokens if t.strip() and t not in STOPWORDS]
+_bge_m3_ef = None
 
-
-def token_to_id(token: str) -> int:
-    # Milvus requires uint32 keys, which fits in 0 to 4294967295
-    return zlib.crc32(token.encode('utf-8')) & 0xFFFFFFFF
-
-
-# 定义函数 get_corpus_stats，用于从数据库元数据中读取语料库统计指标
-def get_corpus_stats() -> dict:
-    try:
-        with get_conn() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute("SELECT `key`, `value` FROM rag_metadata WHERE `key` IN ('total_chunks', 'total_tokens')")
-                meta = {row["key"]: int(row["value"]) for row in cursor.fetchall()}
-                N = meta.get("total_chunks", 0)
-                total_tokens = meta.get("total_tokens", 0)
-                avgdl = total_tokens / N if N > 0 else 0.0
-                
-                # 获取全量的 DF 数据作为向下兼容的备用
-                cursor.execute("SELECT term, df FROM term_df")
-                DF = {row["term"]: row["df"] for row in cursor.fetchall()}
-                
-                return {"N": N, "DF": DF, "avgdl": avgdl}
-    except Exception as e:
-        print(f"[RAG] Failed to get corpus stats from DB: {e}")
-        return {"N": 0, "DF": {}, "avgdl": 0.0}
-
-
-def get_sparse_vector_params(terms: list[str]) -> tuple[int, float, dict[str, int]]:
-    """Fetch BM25 parameters (N, avgdl, DF) from DB only for the given terms."""
-    if not terms:
-        return 0, 0.0, {}
+def get_bge_m3_client() -> BGEM3EmbeddingFunction:
+    global _bge_m3_ef
+    if _bge_m3_ef is None:
+        import torch
+        device = "cpu"
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            device = "mps"
         
-    try:
-        with get_conn() as conn:
-            with conn.cursor() as cursor:
-                # 1. Fetch N and total_tokens
-                cursor.execute("SELECT `key`, `value` FROM rag_metadata WHERE `key` IN ('total_chunks', 'total_tokens')")
-                meta = {row["key"]: int(row["value"]) for row in cursor.fetchall()}
-                N = meta.get("total_chunks", 0)
-                total_tokens = meta.get("total_tokens", 0)
-                avgdl = total_tokens / N if N > 0 else 0.0
-                
-                # 2. Fetch DF only for given terms
-                placeholders = ",".join("%s" for _ in terms)
-                cursor.execute(f"SELECT term, df FROM term_df WHERE term IN ({placeholders})", terms)
-                df_map = {row["term"]: row["df"] for row in cursor.fetchall()}
-                
-                return N, avgdl, df_map
-    except Exception as e:
-        print(f"[RAG] Failed to fetch sparse vector parameters from DB: {e}")
-        return 0, 0.0, {}
-
-
-def update_incremental_stats_on_insert(chunks: list[str]) -> None:
-    """Incrementally update term_df and rag_metadata when new chunks are inserted."""
-    if not chunks:
-        return
-        
-    term_counts = {}
-    total_tokens = 0
-    for chunk in chunks:
-        tokens = tokenize(chunk)
-        total_tokens += len(tokens)
-        for token in set(tokens):
-            term_counts[token] = term_counts.get(token, 0) + 1
+        print(f"[RAG] Initializing local BGE-M3 model on device: {device.upper()}...")
+        local_model_path = os.getenv("BGE_M3_MODEL_PATH", "BAAI/bge-m3")
+        if not os.getenv("HF_ENDPOINT"):
+            os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+        if local_model_path != "BAAI/bge-m3" and not os.path.exists(local_model_path):
+            print(f"[RAG] Configured BGE_M3_MODEL_PATH '{local_model_path}' not found, falling back to 'BAAI/bge-m3'...")
+            local_model_path = "BAAI/bge-m3"
             
-    try:
-        with get_conn() as conn:
-            with conn.cursor() as cursor:
-                # 1. Update term_df
-                terms_data = [(term, df, df) for term, df in term_counts.items()]
-                batch_size = 500
-                for i in range(0, len(terms_data), batch_size):
-                    batch = terms_data[i : i + batch_size]
-                    cursor.executemany(
-                        "INSERT INTO term_df (term, df) VALUES (%s, %s) "
-                        "ON DUPLICATE KEY UPDATE df = df + VALUES(df)",
-                        batch
-                    )
-                
-                # 2. Update rag_metadata
-                cursor.execute("SELECT `key`, `value` FROM rag_metadata WHERE `key` IN ('total_chunks', 'total_tokens')")
-                meta = {row["key"]: int(row["value"]) for row in cursor.fetchall()}
-                
-                new_chunks = meta.get("total_chunks", 0) + len(chunks)
-                new_tokens = meta.get("total_tokens", 0) + total_tokens
-                
-                cursor.execute("INSERT INTO rag_metadata (`key`, `value`) VALUES (%s, %s) ON DUPLICATE KEY UPDATE `value` = %s", ("total_chunks", str(new_chunks), str(new_chunks)))
-                cursor.execute("INSERT INTO rag_metadata (`key`, `value`) VALUES (%s, %s) ON DUPLICATE KEY UPDATE `value` = %s", ("total_tokens", str(new_tokens), str(new_tokens)))
-    except Exception as e:
-        print(f"[RAG] Failed to incrementally update stats on insert: {e}")
+        _bge_m3_ef = BGEM3EmbeddingFunction(
+            model_name=local_model_path,
+            device=device,
+            use_fp16=(device != "cpu")
+        )
+        print("[RAG] Local BGE-M3 model initialized successfully.")
+    return _bge_m3_ef
 
 
-def update_incremental_stats_on_delete(doc_id: str) -> None:
-    """Incrementally update term_df and rag_metadata when chunks are deleted."""
-    try:
-        # Fetch chunks content before deleting
-        with get_conn() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute("SELECT content FROM chunks WHERE document_id = %s", (doc_id,))
-                rows = cursor.fetchall()
-        
-        if not rows:
-            return
-            
-        term_counts = {}
-        total_tokens = 0
-        for r in rows:
-            tokens = tokenize(r["content"])
-            total_tokens += len(tokens)
-            for token in set(tokens):
-                term_counts[token] = term_counts.get(token, 0) + 1
-                
-        with get_conn() as conn:
-            with conn.cursor() as cursor:
-                # 1. Update term_df: decrement df by the counts
-                for term, count in term_counts.items():
-                    cursor.execute("UPDATE term_df SET df = GREATEST(0, df - %s) WHERE term = %s", (count, term))
-                # Delete terms where df <= 0
-                cursor.execute("DELETE FROM term_df WHERE df <= 0")
-                
-                # 2. Update rag_metadata
-                cursor.execute("SELECT `key`, `value` FROM rag_metadata WHERE `key` IN ('total_chunks', 'total_tokens')")
-                meta = {row["key"]: int(row["value"]) for row in cursor.fetchall()}
-                
-                new_chunks = max(0, meta.get("total_chunks", 0) - len(rows))
-                new_tokens = max(0, meta.get("total_tokens", 0) - total_tokens)
-                
-                cursor.execute("INSERT INTO rag_metadata (`key`, `value`) VALUES (%s, %s) ON DUPLICATE KEY UPDATE `value` = %s", ("total_chunks", str(new_chunks), str(new_chunks)))
-                cursor.execute("INSERT INTO rag_metadata (`key`, `value`) VALUES (%s, %s) ON DUPLICATE KEY UPDATE `value` = %s", ("total_tokens", str(new_tokens), str(new_tokens)))
-    except Exception as e:
-        print(f"[RAG] Failed to incrementally update stats on delete: {e}")
-
-
-_corpus_stats = None
-
-
-def get_cached_corpus_stats() -> dict:
-    global _corpus_stats
-    if _corpus_stats is None:
-        _corpus_stats = get_corpus_stats()
-    return _corpus_stats
-
-
-def reset_corpus_stats():
-    global _corpus_stats
-    _corpus_stats = None
-
-
-def build_sparse_vector(text: str, corpus_stats: Optional[dict] = None) -> dict[int, float]:
-    tokens = tokenize(text)
-    if not tokens:
-        return {}
-
-    tf = {}
-    for t in tokens:
-        tf[t] = tf.get(t, 0) + 1
-
-    N, avgdl, df_map = get_sparse_vector_params(list(tf.keys()))
-    if N == 0:
-        # Default fallback representation when corpus statistics are empty
-        sparse_vec = {}
-        for term, freq in tf.items():
-            tid = token_to_id(term)
-            sparse_vec[tid] = float(freq * 2.0)
-        return sparse_vec
-
-    dl = len(tokens)
-    k1 = 1.5
-    b = 0.75
-
-    sparse_vec = {}
-    for term, freq in tf.items():
-        tid = token_to_id(term)
-        df = df_map.get(term, 0)
-        # Calculate IDF
-        idf = max(0.0001, math.log(1.0 + (N - df + 0.5) / (df + 0.5)))
-        # Calculate BM25 weight
-        denom = freq + k1 * (1.0 - b + b * (dl / avgdl))
-        weight = idf * (freq * (k1 + 1.0)) / denom
-        sparse_vec[tid] = float(round(weight, 4))
-
-    return sparse_vec
-
-
-# 定义函数 build_query_sparse_vector，根据查询文本与语料库统计构建查询的稀疏向量表示，用于稀疏检索
-def build_query_sparse_vector(query: str, corpus_stats: Optional[dict] = None) -> dict[int, float]:
-    # 对查询语句进行分词并滤除停用词，得到 token 列表
-    tokens = tokenize(query)
-    print(f"[RAG] Tokens: {tokens}")
-    # 如果分词结果为空列表
-    if not tokens:
-        # 直接返回空的稀疏向量字典
-        return {}
-
-    # 初始化词频（Term Frequency，即词在当前查询中出现的次数）字典 tf
-    tf = {}
-    # 遍历查询分词后的所有 token
-    for t in tokens:
-        # 统计每个 token 在查询中出现的次数
-        tf[t] = tf.get(t, 0) + 1
-
-    N, avgdl, df_map = get_sparse_vector_params(list(tf.keys()))
-    if N == 0:
-        # 降级处理：直接将查询中各词的 token ID 映射到权重 1.0 并返回
-        return {token_to_id(t): 1.0 for t in tokens}
-
-    # 初始化存储最终稀疏向量结果的字典
-    sparse_vec = {}
-    # 遍历查询中各词的词频
-    for term, q_tf in tf.items():
-        # 通过哈希/CRC32 将词转换为对应的 uint32 类型 token ID 键
-        tid = token_to_id(term)
-        # 获取语料库中包含当前词的文档数，若没有则默认为 0
-        df = df_map.get(term, 0)
-        # 依据 BM25/TF-IDF 标准计算逆文档频率 IDF，限制最小值不低于 0.0001
-        idf = max(0.0001, math.log(1.0 + (N - df + 0.5) / (df + 0.5)))
-        # 计算该词在稀疏向量中的权重（查询词频 * IDF），四舍五入保留 4 位小数并转为 float
-        sparse_vec[tid] = float(round(q_tf * idf, 4))
-    # 返回构建好的查询稀疏向量（格式为 {token_id: weight}）
-    print(f"[RAG] Sparse vector: {sparse_vec}")
-    return sparse_vec
+def sparse_to_dict(sparse_array) -> dict[int, float]:
+    """Convert scipy sparse array/matrix to python dict {token_id: weight} for Milvus."""
+    coo = sparse_array.tocoo()
+    return {int(col): float(val) for col, val in zip(coo.col, coo.data)}
 
 
 # ── Milvus Collection Management ──────────────────────────────────────────
 
 
-def ensure_collection(client: MilvusClient, dimension: int) -> None:
+def ensure_collection(client: MilvusClient, dimension: int = 1024) -> None:
     collection_name = os.getenv("MILVUS_COLLECTION", "rag_chunks")
 
-    # If the collection exists with the old schema (does not contain sparse_vector, tenant_id, or kb_id), drop it first
+    # If the collection exists with the old schema or incorrect dimension, drop it first
     if client.has_collection(collection_name=collection_name):
         desc = client.describe_collection(collection_name=collection_name)
-        fields = [f.get("name") for f in desc.get("fields", [])]
-        if "sparse_vector" not in fields or "tenant_id" not in fields or "kb_id" not in fields:
-            print(f"[RAG] Old collection schema detected. Dropping {collection_name} to apply new dense+sparse+tenant partition schema...")
+        fields = desc.get("fields", [])
+        field_names = [f.get("name") for f in fields]
+        dense_field = next((f for f in fields if f.get("name") == "dense_vector"), None)
+        dense_dim = dense_field.get("params", {}).get("dim") or dense_field.get("dim") if dense_field else None
+        
+        if "sparse_vector" not in field_names or "tenant_id" not in field_names or "kb_id" not in field_names or dense_dim != 1024:
+            print(f"[RAG] Old collection schema or dimension mismatch (current: {dense_dim}) detected. Dropping {collection_name} to apply new 1024-dim dense+sparse+tenant partition schema...")
             client.drop_collection(collection_name)
 
     if not client.has_collection(collection_name=collection_name):
@@ -305,6 +135,10 @@ def ensure_collection(client: MilvusClient, dimension: int) -> None:
             index_type="SPARSE_INVERTED_INDEX",
             metric_type="IP"
         )
+        index_params.add_index(
+            field_name="kb_id",
+            index_type="INVERTED"
+        )
 
         client.create_collection(
             collection_name=collection_name,
@@ -312,74 +146,40 @@ def ensure_collection(client: MilvusClient, dimension: int) -> None:
             index_params=index_params
         )
 
+    # Check and dynamically create index on kb_id for existing collection if missing
+    try:
+        indexes = client.list_indexes(collection_name=collection_name)
+        has_kbid_idx = False
+        for idx_name in indexes:
+            try:
+                idx_desc = client.describe_index(collection_name=collection_name, index_name=idx_name)
+                if idx_desc.get("field_name") == "kb_id":
+                    has_kbid_idx = True
+                    break
+            except Exception:
+                pass
+        
+        if not has_kbid_idx:
+            print(f"[RAG] Index on kb_id not found for existing collection. Creating INVERTED index on kb_id...")
+            try:
+                client.release_collection(collection_name)
+            except Exception:
+                pass
+            client.create_index(
+                collection_name=collection_name,
+                field_name="kb_id",
+                index_type="INVERTED"
+            )
+    except Exception as e:
+        print(f"[RAG] Check/Create index on kb_id failed or already exists: {e}")
+
     # Always ensure collection is loaded
     client.load_collection(collection_name)
 
 
-def sync_sqlite_to_milvus() -> None:
-    """Sync existing MySQL chunk embeddings to Milvus collection if empty."""
-    try:
-        with get_conn() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute("""
-                    SELECT c.id, c.document_id, c.content, c.embedding, c.chunk_index,
-                           d.kb_id, d.tenant_id
-                    FROM chunks c
-                    JOIN documents d ON c.document_id = d.id
-                    WHERE c.embedding IS NOT NULL
-                """)
-                rows = cursor.fetchall()
-        if not rows:
-            return
-
-        client = get_milvus_client()
-        collection_name = os.getenv("MILVUS_COLLECTION", "rag_chunks")
-
-        if client.has_collection(collection_name=collection_name):
-            desc = client.describe_collection(collection_name=collection_name)
-            fields = [f.get("name") for f in desc.get("fields", [])]
-            if "sparse_vector" not in fields or "tenant_id" not in fields or "kb_id" not in fields:
-                print(f"[RAG] Old collection schema detected. Dropping {collection_name} to apply new dense+sparse+tenant partition schema...")
-                client.drop_collection(collection_name)
-
-        if not client.has_collection(collection_name=collection_name):
-            first_emb = json.loads(rows[0]["embedding"])
-            ensure_collection(client, len(first_emb))
-
-        stats = client.get_collection_stats(collection_name=collection_name)
-        milvus_count = int(stats.get("row_count", 0))
-
-        if milvus_count == 0:
-            print(f"[RAG] Syncing {len(rows)} existing chunks from MySQL to Milvus...")
-            
-            # Fetch global corpus stats
-            corpus_stats = get_corpus_stats()
-            
-            milvus_data = []
-            for r in rows:
-                emb = json.loads(r["embedding"])
-                milvus_data.append({
-                    "id": r["id"],
-                    "dense_vector": emb,
-                    "sparse_vector": build_sparse_vector(r["content"], corpus_stats),
-                    "document_id": r["document_id"],
-                    "kb_id": r["kb_id"],
-                    "tenant_id": r["tenant_id"]
-                })
-
-            batch_size = 100
-            for i in range(0, len(milvus_data), batch_size):
-                client.insert(collection_name=collection_name, data=milvus_data[i : i + batch_size])
-            print(f"[RAG] Synced {len(milvus_data)} chunks to Milvus successfully.")
-    except Exception as e:
-        print(f"[RAG] MySQL to Milvus sync failed or skipped: {e}")
-
 
 def delete_document(doc_id: str, tenant_id: str) -> None:
     """Delete a document from both MySQL and Milvus."""
-    # First, update incremental stats
-    update_incremental_stats_on_delete(doc_id)
-
     from db import delete_document_by_id
     delete_document_by_id(doc_id, tenant_id)
 
@@ -440,43 +240,25 @@ def chunk_text(text: str, chunk_size: int = 600, overlap: int = 120) -> list[str
     return chunks
 
 
-# ── Embedding ─────────────────────────────────────────────────────────────
-
-_GEMINI_HOST = "generativelanguage.googleapis.com"
-
-
-async def _embed_gemini(text: str, base_url: str, api_key: str, model: str) -> list[float]:
-    """Call Gemini native embedContent API."""
-    url = f"{base_url.rstrip('/')}/models/{model}:embedContent"
-    body = {"content": {"parts": [{"text": text}]}}
-    async with httpx.AsyncClient(timeout=30) as client:
-        res = await client.post(url, json=body, headers={"x-goog-api-key": api_key})
-        res.raise_for_status()
-        return res.json()["embedding"]["values"]
-
-
-async def _embed_openai(text: str, base_url: str, api_key: str, model: str) -> list[float]:
-    """Call any OpenAI-compatible embeddings API."""
-    client = AsyncOpenAI(base_url=base_url, api_key=api_key)
-    res = await client.embeddings.create(model=model, input=text)
-    return res.data[0].embedding
-
-
-async def get_embedding(text: str) -> Optional[list[float]]:
-    api_key = os.getenv("EMBEDDING_API_KEY") or os.getenv("MIMO_API_KEY")
-    if not api_key:
-        return None
-
-    base_url = os.getenv("EMBEDDING_BASE_URL") or os.getenv("MIMO_BASE_URL", "https://api.siliconflow.cn/v1")
-    model = os.getenv("EMBEDDING_MODEL", "BAAI/bge-m3")
-
-    try:
-        if _GEMINI_HOST in base_url:
-            return await _embed_gemini(text, base_url, api_key, model)
-        return await _embed_openai(text, base_url, api_key, model)
-    except Exception as e:
-        print(f"[RAG] Embedding failed: {e}")
-        return None
+def merge_overlapping_strings(s1: str, s2: str) -> str:
+    """Merge s1 and s2, identifying and deduplicating any overlapping suffix of s1 and prefix of s2."""
+    s1_clean = s1.strip()
+    s2_clean = s2.strip()
+    if not s1_clean:
+        return s2_clean
+    if not s2_clean:
+        return s1_clean
+        
+    # Detect up to 300 characters of overlap
+    max_check_len = min(len(s1_clean), len(s2_clean), 300)
+    best_overlap_len = 0
+    for i in range(1, max_check_len + 1):
+        if s1_clean[-i:] == s2_clean[:i]:
+            best_overlap_len = i
+            
+    if best_overlap_len > 0:
+        return s1_clean + s2_clean[best_overlap_len:]
+    return s1_clean + "\n" + s2_clean
 
 
 # ── Public API ────────────────────────────────────────────────────────────
@@ -499,43 +281,45 @@ async def add_document(title: str, content: str, kb_id: str, tenant_id: str) -> 
             )
 
     chunks = chunk_text(content)
+    if not chunks:
+        return doc_id
 
-    # Embed in batches of 5 to respect rate limits
-    batch_size = 5
+    # Generate embeddings and sparse vectors locally using BGE-M3
+    bge_m3 = get_bge_m3_client()
+    res = await asyncio.to_thread(bge_m3, chunks)
+
     milvus_data = []
-
-    for i in range(0, len(chunks), batch_size):
-        batch = chunks[i : i + batch_size]
-        embeddings = await asyncio.gather(*[get_embedding(c) for c in batch])
-        with get_conn() as conn:
-            with conn.cursor() as cursor:
-                for j, (chunk, emb) in enumerate(zip(batch, embeddings)):
-                    chunk_id = str(uuid4())
-                    cursor.execute(
-                        "INSERT INTO chunks (id, document_id, content, embedding, chunk_index) VALUES (%s, %s, %s, %s, %s)",
-                        (chunk_id, doc_id, chunk, json.dumps(emb) if emb else None, i + j),
-                    )
-                    if emb:
-                        milvus_data.append({
-                            "id": chunk_id,
-                            "dense_vector": emb,
-                            "sparse_vector": build_sparse_vector(chunk),
-                            "document_id": doc_id,
-                            "kb_id": kb_id,
-                            "tenant_id": tenant_id
-                        })
+    with get_conn() as conn:
+        with conn.cursor() as cursor:
+            for idx, chunk in enumerate(chunks):
+                chunk_id = str(uuid4())
+                dense_vec = res["dense"][idx].tolist()
+                sparse_vec = sparse_to_dict(res["sparse"][idx])
+                
+                # Write to MySQL chunks table
+                cursor.execute(
+                    "INSERT INTO chunks (id, document_id, content, embedding, chunk_index) VALUES (%s, %s, %s, %s, %s)",
+                    (chunk_id, doc_id, chunk, json.dumps(dense_vec), idx),
+                )
+                
+                milvus_data.append({
+                    "id": chunk_id,
+                    "dense_vector": dense_vec,
+                    "sparse_vector": sparse_vec,
+                    "document_id": doc_id,
+                    "kb_id": kb_id,
+                    "tenant_id": tenant_id
+                })
 
     if milvus_data:
         try:
             client = get_milvus_client()
             collection_name = os.getenv("MILVUS_COLLECTION", "rag_chunks")
-            ensure_collection(client, len(milvus_data[0]["dense_vector"]))
+            ensure_collection(client, 1024)
             client.insert(collection_name=collection_name, data=milvus_data)
             print(f"[RAG] Inserted {len(milvus_data)} chunks into Milvus successfully.")
         except Exception as e:
             print(f"[RAG] Milvus insertion failed: {e}")
-
-    update_incremental_stats_on_insert(chunks)
 
     return doc_id
 
@@ -547,13 +331,30 @@ async def search_knowledge(
     top_k: int = 4, 
     chat_history: Optional[list[dict]] = None
 ) -> dict:
+    """
+    RAG 知识检索核心方法。
+    
+    检索流程包含以下阶段：
+    1. 查询重写 (Query Rewriting)：结合历史对话上下文将多轮问答问题重写为独立的检索 query。
+    2. 向量化 (Embedding Generation)：使用 BGE-M3 模型生成密向量与稀疏向量表示。
+    3. 混合检索与排序融合 (Milvus Hybrid Search & Fusion)：利用 Milvus 支持的 Dense 与 Sparse 向量进行混合检索，
+       并根据配置的环境变量选择 WeightedRanker (加权融合) 或 RRFRanker (互反排名融合) 进行排序融合。
+    4. 一次性元数据拉取 (Consolidated Metadata Fetch - 优化1)：一次性从 MySQL 获取候选 chunks 及其对应 documents 的元数据，
+       避免多重回表查询，降低接口 RT。
+    5. Rerank 重排管道 (Rerank Pipeline)：根据权重或分数进行 Cross-Encoder 二次精细打分。
+    6. 上下文扩展与去重拼接 (Context Merging & Deduplication - 优化3)：为 top_k chunks 批量获取邻近块，
+       对序号连续的块运用 merge_overlapping_strings 算法对 overlap 的 120 字符重叠段进行对齐去重，避免 prompt 噪音污染并节省 token 预算。
+    7. 格式化构建 (XML Output Builder)：以 XML 节点形式组织文档段落，并应用 8000 字符的硬限预算以防 token 溢出。
+    """
+    # 验证输入的安全性和格式，防止恶意的 ID 输入
     if not validate_safe_id(kb_id) or not validate_safe_id(tenant_id):
         print(f"[RAG] Invalid search identifiers: kb_id={kb_id}, tenant_id={tenant_id}")
         return {"context": "", "sources": []}
 
-    print(f"[RAG] Searching knowledge for query: {query}, kb_id: {kb_id}, tenant_id: {tenant_id}, chat_history: {len(chat_history)}")
+    print(f"[RAG] Searching knowledge for query: {query}, kb_id: {kb_id}, tenant_id: {tenant_id}, chat_history: {len(chat_history) if chat_history else 0}")
 
-    # 1. 对话查询重写 (Query Rewriting)
+    # 1. 对话查询重写 (Query Rewriting) with Timeout
+    # 若包含历史对话，使用大语言模型补全当前 query 中可能缺失的代词或指代信息，生成独立的 Standalone 核心问题
     search_query = query
     if chat_history and len(chat_history) > 0:
         try:
@@ -562,7 +363,7 @@ async def search_knowledge(
             mimo_model = os.getenv("MIMO_MODEL", "Xiaomi/MiMo-7B-RL")
             
             if mimo_api_key:
-                # 仅保留最近5轮对话以平衡性能和成本
+                # 仅保留最近 5 轮对话以平衡性能和成本
                 history_slice = chat_history[-5:]
                 formatted_history = ""
                 for msg in history_slice:
@@ -570,59 +371,120 @@ async def search_knowledge(
                     content_str = msg.get("content", "")
                     formatted_history += f"{role_str}: {content_str}\n"
                 
-                rewrite_prompt = f"""你是一个智能检索助手。请结合以下历史对话内容和用户最新的问题，生成一个最适合用来检索知识库的核心问题（Standalone Search Query）。
+                # 引导 LLM 生成最契合知识检索的问题
+                rewrite_prompt = f"""你是一个智能检索助手。请结合以下对话历史和用户最新的问题，生成一个最适合用来检索知识库的核心问题（Standalone Search Query）。
 这个核心问题应当：
 1. 包含历史上下文中必要的实体、名词以及指代词指向的具体对象（补全省略信息）；
-2. 保持简洁，去除多余 of 问候语或解释性文字；
+2. 保持简洁，去除多余的问候语或解释性文字；
 3. 直接输出这个独立的核心问题，不要包含任何多余的前言、解释或标记。
+4. 如果是某些领域的专有名词，则原路返回这个名词
+5. 如果是一些打招呼、感谢语、感叹语之类的不需要检索知识库的语句，直接返回：None
+
+【示例一】
+对话历史：
+用户：贵州茅台最新的财报怎么样？
+助手：贵州茅台2024年年报显示营收同比增长15%，净利润创历史新高。
+用户最新的问题：它的分红政策呢？
+核心问题：贵州茅台的分红政策
+
+【示例二】
+对话历史：
+用户：什么是市盈率？
+助手：市盈率（PE）是股价除以每股收益，反映投资者为每单位收益愿意支付的价格。
+用户最新的问题：你好
+核心问题：None
+
+【示例三】
+用户最新的问题：No.23214
+核心问题：No.23214
 
 【对话历史】
 {formatted_history}
 
-【最新问题】
+【用户最新的问题】
 {query}
 
 【核心问题】"""
 
-                client = AsyncOpenAI(base_url=mimo_base_url, api_key=mimo_api_key)
-                response = await client.chat.completions.create(
-                    model=mimo_model,
-                    messages=[{"role": "user", "content": rewrite_prompt}],
-                    temperature=0.3,
-                    max_tokens=512
+                client = get_openai_client(mimo_base_url, mimo_api_key)
+                # 使用 wait_for 设定 2.5 秒超时防止影响聊天响应流畅度
+                print("requesting rewrite query...")
+                response = await asyncio.wait_for(
+                    client.chat.completions.create(
+                        model=mimo_model,
+                        messages=[{"role": "user", "content": rewrite_prompt}],
+                        temperature=0.3,
+                        max_tokens=1024  # MiMo 等推理模型需要为 <think>思考链</think> 预留足够空间，实际答案本身很短
+                    ),
+                    timeout=30
                 )
 
-                rewritten = response.choices[0].message.content
+                rewritten = None
+                if response and response.choices and len(response.choices) > 0:
+                    message = response.choices[0].message
+                    if message and message.content:
+                        rewritten = message.content.strip()
+
+                print(f"[RAG STEP 1]{rewritten}")
+
+                # 对思考型推理大模型的输出进行后处理，提取并过滤掉思考标签
                 if rewritten:
-                    rewritten = rewritten.strip()
-                    # Clean up <think>...</think> from content for reasoning models
                     if "<think>" in rewritten:
                         if "</think>" in rewritten:
                             rewritten = rewritten.split("</think>")[-1].strip()
                         else:
                             rewritten = rewritten.split("<think>")[0].strip()
 
-
-                if rewritten:
-                    rewritten = rewritten.strip('"\'`').strip()
+                    rewritten = rewritten.strip('"\'\'`').strip()
                     if rewritten and len(rewritten) < 100:
-                        print(f"[RAG] Rewrite query: '{query}' -> '{rewritten}'")
+                        print(f"Rewrite query: '{query}' -> '{rewritten}'")
                         search_query = rewritten
+                    else:
+                        # 重写后为空或过长，视为无明确检索意图，跳过知识库搜索
+                        print(f"[RAG] Rewritten query empty or too long, skipping knowledge search.")
+                        return {"context": "", "sources": []}
+                else:
+                    # rewritten 为 None，LLM 显式判断无明确问题（如闲聊），跳过知识库搜索
+                    print(f"[RAG] Query rewriting returned None (no retrieval intent), skipping knowledge search.")
+                    return {"context": "", "sources": []}
         except Exception as e:
-            print(f"[RAG] Query rewriting failed: {e}")
+            print(f"[RAG] Query rewriting bypassed or timed out: {e}")
 
-    query_emb = await get_embedding(search_query)
+    # 2. 向量化查询 (Embedding Generation)
+    # 利用 BGE-M3 生成密集和稀疏特征表示
+    try:
+        bge_m3 = get_bge_m3_client()
+        res = await asyncio.to_thread(bge_m3, [search_query])
+        query_emb = res["dense"][0].tolist()
+        query_sparse = sparse_to_dict(res["sparse"][0])
+        print(f"[RAG STEP 2] dense and sparse convert: {search_query}")
+        # print(query_emb)
+        # print(query_sparse)
+    except Exception as e:
+        print(f"[RAG] BGE-M3 query vector generation failed: {e}")
+        query_emb = None
+        query_sparse = None
 
-    if query_emb:  # 如果成功生成了查询文本的密集向量表示
+    if query_emb is not None:  # 如果成功生成了查询文本的密集向量表示
         try:  # 开启 try-except 块以捕获向量搜索过程中的异常
             client = get_milvus_client()  # 获取 Milvus 数据库客户端实例
             collection_name = os.getenv("MILVUS_COLLECTION", "rag_chunks")  # 从环境变量获取 Milvus 集合名称，默认为 "rag_chunks"
-            if client.has_collection(collection_name=collection_name):  # 检查 Milvus 中是否存在该集合
-                query_sparse = build_query_sparse_vector(search_query)  # 构建查询文本的稀疏向量表示，用于稀疏检索
-                
-                filter_expr = f"tenant_id == '{tenant_id}' and kb_id == '{kb_id}'"  # 构造租户与知识库逻辑隔离的分区路由过滤表达式
+            
+            # 使用全局缓存避免重复检查 collection 是否加载
+            has_coll = False
+            if collection_name in _checked_collections:
+                has_coll = True
+            else:
+                has_coll = await asyncio.to_thread(client.has_collection, collection_name=collection_name)
+                if has_coll:
+                    _checked_collections.add(collection_name)
 
-                # 2. 检查 Reranker 配置
+            if has_coll:  # 检查 Milvus 中是否存在该集合
+                
+                # 构造租户与知识库逻辑隔离的分区路由过滤表达式
+                filter_expr = f"tenant_id == '{tenant_id}' and kb_id == '{kb_id}'"
+
+                # 检查 Reranker 模型接口配置
                 reranker_api_key = os.getenv("RERANKER_API_KEY")
                 reranker_base_url = os.getenv("RERANKER_BASE_URL", "https://api.siliconflow.cn/v1")
                 reranker_model = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
@@ -634,67 +496,124 @@ async def search_knowledge(
                     reranker_threshold = None
                     
                 use_reranker = bool(reranker_api_key)
-                # 如果使用 Rerank，则 Milvus 检索增加召回数量 (limit)
+                # 如果使用 Rerank，则 Milvus 检索增加召回数量 (limit) 以确保更优召回率
                 retrieval_limit = max(15, top_k * 3) if use_reranker else top_k
 
-                req_dense = AnnSearchRequest(  # 实例化密集向量检索请求对象
-                    data=[query_emb],  # 传入查询文本的密集向量数据列表
-                    anns_field="dense_vector",  # 指定检索的向量字段为 "dense_vector"
-                    param={"metric_type": "COSINE", "params": {}},  # 设置检索度量类型为余弦相似度（COSINE）
-                    limit=retrieval_limit,  # 限制该子检索返回的最大相似结果数
-                    expr=filter_expr  # 注入租户与知识库过滤表达式进行预过滤以限制检索范围
+                # 构造密集向量和稀疏向量的检索子请求
+                req_dense = AnnSearchRequest(
+                    data=[query_emb],
+                    anns_field="dense_vector",
+                    param={"metric_type": "COSINE", "params": {}},
+                    limit=retrieval_limit,
+                    expr=filter_expr
                 )
-                req_sparse = AnnSearchRequest(  # 实例化稀疏向量检索请求对象
-                    data=[query_sparse] if query_sparse else [{}],  # 若稀疏向量非空则使用空字典列表
-                    anns_field="sparse_vector",  # 指定检索的向量字段为 "sparse_vector"
-                    param={"metric_type": "IP", "params": {}},  # 设置检索度量类型为内积（IP - Inner Product）
-                    limit=retrieval_limit,  # 限制该子检索返回的最大相似结果数
-                    expr=filter_expr  # 注入相同的过滤表达式进行预过滤以限制检索范围
+                req_sparse = AnnSearchRequest(
+                    data=[query_sparse] if query_sparse else [{}],
+                    anns_field="sparse_vector",
+                    param={"metric_type": "IP", "params": {}},
+                    limit=retrieval_limit,
+                    expr=filter_expr
                 )
                 
-                search_res = client.hybrid_search(  # 执行密集加稀疏向量的双通道混合检索
+                # 3. 混合检索融合权重配置 (Hybrid Search Ranker Config - 优化4)
+                # 支持通过环境变量配置 WeightedRanker 赋予 Dense 和 Sparse 不同的检索融合倾向
+                dense_weight_str = os.getenv("HYBRID_DENSE_WEIGHT")
+                sparse_weight_str = os.getenv("HYBRID_SPARSE_WEIGHT")
+                
+                ranker = RRFRanker()
+                if dense_weight_str is not None and sparse_weight_str is not None:
+                    try:
+                        dense_weight = float(dense_weight_str)
+                        sparse_weight = float(sparse_weight_str)
+                        ranker = WeightedRanker(dense_weight, sparse_weight)
+                        print(f"[RAG] Using WeightedRanker with weights: dense={dense_weight}, sparse={sparse_weight}")
+                    except ValueError:
+                        print(f"[RAG] Invalid weights for WeightedRanker: dense={dense_weight_str}, sparse={sparse_weight_str}. Falling back to RRFRanker.")
+
+                # 在线程池中非阻塞执行 Milvus 混合向量检索
+                search_res = await asyncio.to_thread(
+                    client.hybrid_search,
                     collection_name=collection_name,  # 指定目标检索集合名称
                     reqs=[req_dense, req_sparse],  # 传入并行子检索请求列表
-                    ranker=RRFRanker(),  # 指定互反排名融合算法（RRFRanker）对结果进行重排与排序融合
+                    ranker=ranker,  # 指定融合算法对结果进行重排与排序融合
                     limit=retrieval_limit,  # 限制重排融合后最终返回的最大相似结果数
                     output_fields=["document_id"]  # 声明需要 Milvus 额外返回文档 ID（document_id）字段
                 )
+
+                print(f"[RAG STEP 3] search: {len(search_res[0])}")
+                """
+                [
+                    {
+                        "id": "ca1a11b4-a262-4239-853e-fe0a458eb81a",
+                        "distance": 0.015384615398943424,
+                        "entity": {
+                            "document_id": "0877ade9-08fb-43cb-b356-609f6b577835"
+                        }
+                    }
+                ]
+                """
 
                 if search_res and search_res[0]:  # 如果混合检索结果不为空且第一个查询有返回结果
                     hits = search_res[0]  # 提取检索返回的匹配结果列表（hits）
                     top_hits = [h for h in hits if h.get("distance", 0.0) > 0.0]  # 过滤相似度得分（distance）大于 0.0 的有效检索结果
 
                     if top_hits:  # 如果存在过滤后的有效相似匹配项
-                        doc_ids = list({h.get("id") for h in top_hits})  # 提取并去重所有匹配项的主键（即 MySQL 中的 chunk ID）并转为列表
+                        doc_ids = [h.get("id") for h in top_hits]
                         
-                        chunk_details = {}  # 初始化字典，以 chunk ID 作为键存放关系库中的文本块详细信息
-                        if doc_ids:  # 如果提取到的匹配 chunk ID 列表不为空
-                            placeholders = ",".join("%s" for _ in doc_ids)  # 根据 ID 数量生成 SQL 参数占位符，如 "%s,%s"
-                            query_sql = f"""
-                                SELECT c.id, c.content, c.chunk_index, d.id AS doc_id, d.title AS doc_title 
-                                FROM chunks c 
-                                JOIN documents d ON d.id = c.document_id 
-                                WHERE c.id IN ({placeholders}) AND d.tenant_id = %s
-                            """  # 构造 SQL 查询，关联 chunks 表与 documents 表，强制加入 tenant_id 条件确保多租户安全
-                            with get_conn() as conn:
-                                with conn.cursor() as cursor:
-                                    cursor.execute(query_sql, doc_ids + [tenant_id])
-                                    # 获取所有查询到的结果行
-                                    rows = cursor.fetchall()
-                                    # 遍历每一行查询到的数据
-                                    for r in rows:
-                                        # 将 chunk 详细信息存入字典，以 chunk 的 ID 为键
-                                        chunk_details[r["id"]] = r
+                        # --- OPTIMIZATION: Consolidate Database Calls (Load complete metadata in one query - 优化1) ---
+                        # 单次数据库批量反查：一次性拉取候选 Chunks 及其对应文档的所有关联数据（内容、序号、文档标题等）
+                        candidate_metadata = {}
+                        if doc_ids:
+                            def fetch_candidate_metadata(ids, tenant):
+                                placeholders = ",".join("%s" for _ in ids)
+                                sql = f"""
+                                    SELECT c.id, c.content, c.chunk_index, d.id AS doc_id, d.title AS doc_title 
+                                    FROM chunks c 
+                                    JOIN documents d ON d.id = c.document_id 
+                                    WHERE c.id IN ({placeholders}) AND d.tenant_id = %s
+                                """
+                                with get_conn() as conn:
+                                    with conn.cursor() as cursor:
+                                        cursor.execute(sql, ids + [tenant])
+                                        return cursor.fetchall()
+                            try:
+                                rows = await asyncio.to_thread(fetch_candidate_metadata, doc_ids, tenant_id)
+                                for r in rows:
+                                    candidate_metadata[r["id"]] = r
+
+                                print(f"[RAG STEP 4] supplement candidate_metadata： {len(candidate_metadata)}")
+                                """
+                                {
+                                    "f454a408-6761-45b1-bb11-82778c952e30": {
+                                        "id": "f454a408-6761-45b1-bb11-82778c952e30",
+                                        "content": "的投资范围、策略逻辑与风险收益特征，能够更准确地反映产品定位。对于基民而言",
+                                        "chunk_index": 7,
+                                        "doc_id": "0877ade9-08fb-43cb-b356-609f6b577835",
+                                        "doc_title": "长新闻"
+                                    },
+                                    "2229e449-5a8b-4c0d-9510-a2f06df7d206": {
+                                        "id": "2229e449-5a8b-4c0d-9510-a2f06df7d206",
+                                        "content": "明星妈妈可以享受9折的商品优惠",
+                                        "chunk_index": 0,
+                                        "doc_id": "0de44f29-05df-4b9a-991c-d1270c967532",
+                                        "doc_title": "明星妈妈"
+                                    },
+                                }
+                                """
+                            except Exception as db_err:
+                                print(f"[RAG] Failed to fetch candidate metadata: {db_err}")
 
                         # 3. 运行 Rerank 重排管道
-                        if use_reranker and chunk_details:
+                        # 如果配置了 Rerank 密钥，使用 Cross-Encoder 二次精细化对比评分
+                        reranked_hits = top_hits
+                        if use_reranker and candidate_metadata:
                             candidate_chunks = []
                             for hit in top_hits:
                                 cid = hit.get("id")
-                                if cid in chunk_details:
+                                if cid in candidate_metadata:
                                     candidate_chunks.append({
                                         "id": cid,
-                                        "content": chunk_details[cid]["content"],
+                                        "content": candidate_metadata[cid]["content"],
                                         "score": hit.get("distance", 0.0)
                                     })
                             
@@ -711,84 +630,214 @@ async def search_knowledge(
                                         "documents": [c["content"] for c in candidate_chunks],
                                         "top_n": top_k
                                     }
-                                    async with httpx.AsyncClient(timeout=15) as http_client:
-                                        res = await http_client.post(rerank_url, json=body, headers=headers)
-                                        res.raise_for_status()
-                                        reranked_data = res.json()
+                                    http_client = get_http_client()
+                                    res = await http_client.post(rerank_url, json=body, headers=headers, timeout=3.0)
+                                    res.raise_for_status()
+                                    reranked_data = res.json()
                                     
-                                    results = reranked_data.get("results", [])
-                                    reranked_chunks = []
+                                    results = (
+                                        reranked_data.get("results", [])
+                                        if isinstance(reranked_data, dict)
+                                        else []
+                                    )
+                                    filtered_chunks = []
                                     for r in results:
+                                        if not isinstance(r, dict):
+                                            continue
                                         idx = r.get("index")
+                                        if idx is None or not isinstance(idx, (int, float)):
+                                            continue
+                                        idx = int(idx)
                                         score = r.get("relevance_score", 0.0)
-                                        # 过滤低于阈值的文档
+                                        # 过滤低于 Reranker 阈值的文档
                                         if reranker_threshold is not None and score < reranker_threshold:
                                             continue
                                         if 0 <= idx < len(candidate_chunks):
                                             c = candidate_chunks[idx]
                                             c["score"] = score
-                                            reranked_chunks.append(c)
+                                            filtered_chunks.append(c)
                                     
-                                    print(f"[RAG] Reranker model '{reranker_model}' returned {len(reranked_chunks)} documents above threshold {reranker_threshold}")
-                                    
-                                    top_hits_processed = []
-                                    for rc in reranked_chunks:
-                                        top_hits_processed.append({
+                                    # 构建最终重排后的 top-k 节点列表
+                                    reranked_hits = []
+                                    for rc in filtered_chunks[:top_k]:
+                                        reranked_hits.append({
                                             "id": rc["id"],
                                             "distance": rc["score"]
                                         })
-                                    top_hits = top_hits_processed[:top_k]
+                                    print(f"[RAG STEP 5] Reranker model '{reranker_model}' returned {len(filtered_chunks)} documents above threshold {reranker_threshold}")
+                                    # print(json.dumps(filtered_chunks, ensure_ascii=False, indent=2))
+
                                 except Exception as re_err:
-                                    print(f"[RAG] Reranking request failed: {re_err}")
-                                    top_hits = top_hits[:top_k]
+                                    print(f"[RAG] Reranking request failed or timed out: {re_err}")
+                                    reranked_hits = top_hits[:top_k]
                         else:
-                            top_hits = top_hits[:top_k]
+                            reranked_hits = top_hits[:top_k]
+
+                        # --- OPTIMIZATION: Read Chunk Metadata from Memory (No DB query required - 优化1) ---
+                        # 直接从内存 `candidate_metadata` 中快速抽取最终重排过后的 chunk 数据，无需二次数据库调用
+                        final_chunk_ids = [h["id"] for h in reranked_hits]
+                        chunk_metadata = {cid: candidate_metadata[cid] for cid in final_chunk_ids if cid in candidate_metadata}
+
+                        # 邻近块扩展策略：收集最终匹配 chunks 的前后邻接索引，用于扩充上下文滑窗
+                        adjacent_chunk_map = {}
+                        query_tuples = []
+                        for hit in reranked_hits:
+                            r = chunk_metadata.get(hit.get("id"))
+                            if r:
+                                doc_id = r["doc_id"]
+                                c_idx = r["chunk_index"]
+                                if c_idx > 0:
+                                    query_tuples.append((doc_id, c_idx - 1))
+                                query_tuples.append((doc_id, c_idx + 1))
+                        
+                        # 邻接块查询目标去重
+                        query_tuples = list(set(query_tuples))
+                        
+                        if query_tuples:
+                            # 从数据库批量加载所有邻近块的文本
+                            def fetch_adjacent_chunks(tuples):
+                                conds = []
+                                params = []
+                                for d_id, c_idx in tuples:
+                                    conds.append("(document_id = %s AND chunk_index = %s)")
+                                    params.extend([d_id, c_idx])
+                                adj_sql = f"""
+                                    SELECT document_id, chunk_index, content 
+                                    FROM chunks 
+                                    WHERE {" OR ".join(conds)}
+                                """
+                                with get_conn() as conn:
+                                    with conn.cursor() as cursor:
+                                        cursor.execute(adj_sql, params)
+                                        return cursor.fetchall()
+
+                            try:
+                                adj_rows = await asyncio.to_thread(fetch_adjacent_chunks, query_tuples)
+                                for row in adj_rows:
+                                    adjacent_chunk_map[(row["document_id"], row["chunk_index"])] = row["content"]
+                            except Exception as adj_err:
+                                print(f"[RAG] Failed to fetch adjacent chunks: {adj_err}")
+                        print(f"adjacent_chunk len: {len(adjacent_chunk_map)}")
+
+                        # 构建 (doc_id, chunk_index) → content 的统一内容索引表，供后续滑窗拼接使用
+                        content_by_index = {}
+                        # 第一步：写入命中块（来自内存缓存 chunk_metadata，无需再查库）
+                        for detail in chunk_metadata.values():
+                            content_by_index[(detail["doc_id"], detail["chunk_index"])] = detail["content"]
+                        # 第二步：写入邻近扩展块（来自数据库补查的 adjacent_chunk_map），若与命中块索引重叠则覆盖（实际不会重叠）
+                        for (d_id, idx), content in adjacent_chunk_map.items():
+                            content_by_index[(d_id, idx)] = content
+
+                        print(f"[RAG STEP 6] final enhanced doc: {len(content_by_index)}")
+                        print(json.dumps({f"{k[0]}:{k[1]}": v for k, v in content_by_index.items()}, ensure_ascii=False, indent=2))
 
                         # 初始化返回的数据源列表，用于返回给前端或调用方
                         sources = []
-                        # 初始化上下文部分的文本块列表，用于合成最终 key context 字符串
-                        context_parts = []
-                        # 初始化用于标记来源编号的计数器，从 1 开始
-                        valid_i = 1
-                        # 遍历检索出的前几个最相关的匹配项
-                        for hit in top_hits:
-                            # 获取当前匹配项的 chunk ID
+                        # 统计每个文档所召回和扩展的块索引集
+                        doc_indices = {}
+                        doc_titles = {}
+                        doc_max_scores = {}
+
+                        for hit in reranked_hits:
                             chunk_id = hit.get("id")
-                            # 从数据库查询出来的详细信息字典中获取对应 chunk 的数据
-                            r = chunk_details.get(chunk_id)
-                            # 如果该 chunk 不在数据库的详细数据中，则跳过
+                            r = chunk_metadata.get(chunk_id)
                             if not r:
                                 continue
-                                
-                            # 获取对应的文档 ID
                             doc_id = r["doc_id"]
-                            # 获取对应的文本块具体内容
-                            content = r["content"]
-                            # 获取对应的文档标题，如果为空则默认为 "未知文档"
+                            c_idx = r["chunk_index"]
                             title = r["doc_title"] or "未知文档"
-                            # 获取该匹配项的相似度分数（distance）
                             score = hit.get("distance", 0.0)
 
-                            # 将该匹配数据源拼装后添加到 sources 列表中
+                            doc_titles[doc_id] = title
+                            doc_max_scores[doc_id] = max(doc_max_scores.get(doc_id, 0.0), score)
+
+                            if doc_id not in doc_indices:
+                                doc_indices[doc_id] = set()
+
+                            # 将当前块和合法的邻近块加入该文档的待拼接索引列表
+                            for idx in (c_idx - 1, c_idx, c_idx + 1):
+                                if (doc_id, idx) in content_by_index:
+                                    doc_indices[doc_id].add(idx)
+
+                            # 组装返回数据源 sources（提供给前端做引用高亮和来源卡片）
                             sources.append({
-                                # 文档 ID
                                 "documentId": doc_id,
-                                # 文档标题
                                 "documentTitle": title,
-                                # 截取前 220 个字符的文本块内容，若超出则加省略号 "…"
-                                "chunkContent": content[:220] + ("…" if len(content) > 220 else ""),
-                                # 对匹配得分保留 4 位小数
+                                "chunkContent": r["content"][:220] + ("…" if len(r["content"]) > 220 else ""),
                                 "score": round(score, 4),
                             })
-                            # 将格式化后的文档标题与内容拼装并存入 context_parts
-                            context_parts.append(f"[来源{valid_i}] {title}\n{content}")
-                            # 增加来源计数器
-                            valid_i += 1
 
-                        # 将所有来源的文本片段用 "\n\n---\n\n" 拼接成一个大字符串，作为最终的 context
-                        context = "\n\n---\n\n".join(context_parts)
+                        # 将零散索引合并为连续区间的辅助函数
+                        def merge_contiguous_indexes(indexes: list[int]) -> list[tuple[int, int]]:
+                            if not indexes:
+                                return []
+                            sorted_idx = sorted(list(set(indexes)))
+                            ranges = []
+                            start = sorted_idx[0]
+                            prev = start
+                            for idx in sorted_idx[1:]:
+                                if idx == prev + 1:
+                                    prev = idx
+                                else:
+                                    ranges.append((start, prev))
+                                    start = idx
+                                    prev = idx
+                            ranges.append((start, prev))
+                            return ranges
+
+                        # 按文档召回的最高相似分对文档进行降序排序
+                        sorted_docs = sorted(doc_max_scores.keys(), key=lambda d: doc_max_scores[d], reverse=True)
+                        
+                        # 初始化上下文部分的文本块列表，用于合成最终 key context 字符串
+                        context_parts = []
+                        char_budget = 8000  # 设定 8000 字符的软限制保护 Prompt 不超上限
+                        current_chars = 0
+
+                        # 将匹配到的文档以规范 of XML 节点形式拼入 Context 中，并实时计算字符预算
+                        for doc_id in sorted_docs:
+                            if current_chars >= char_budget:
+                                break
+                            title = doc_titles[doc_id]
+                            fetched_indexes = list(doc_indices.get(doc_id, []))
+                            ranges = merge_contiguous_indexes(fetched_indexes)
+                            
+                            doc_segments = []
+                            for start_idx, end_idx in ranges:
+                                merged_range_content = ""
+                                for idx in range(start_idx, end_idx + 1):
+                                    chunk_content = content_by_index.get((doc_id, idx))
+                                    if chunk_content:
+                                        if not merged_range_content:
+                                            merged_range_content = chunk_content
+                                        else:
+                                            # --- OPTIMIZATION: Overlap Deduplication (去重拼接 - 优化3) ---
+                                            # 当拼接连续索引的块文本时，使用 merge_overlapping_strings 去除 chunk 之间的 overlap 重合内容
+                                            merged_range_content = merge_overlapping_strings(merged_range_content, chunk_content)
+                                if merged_range_content:
+                                    doc_segments.append(merged_range_content)
+
+                            if doc_segments:
+                                # 同一个文档内不同连续区间使用隔离线相连
+                                doc_body = "\n\n---\n\n".join(doc_segments)
+                                xml_node = f'<document title="{title}">\n{doc_body}\n</document>'
+                                
+                                # 字符预算超限保护，支持在边界截断，防止系统出错
+                                if current_chars + len(xml_node) > char_budget:
+                                    remaining_budget = char_budget - current_chars
+                                    if remaining_budget > 500:
+                                        xml_node = f'<document title="{title}">\n{doc_body[:remaining_budget]}... [已截断]\n</document>'
+                                        context_parts.append(xml_node)
+                                    break
+                                
+                                context_parts.append(xml_node)
+                                current_chars += len(xml_node)
+
+                        # 将所有来源的文本片段拼接成一个大字符串，作为最终的 context
+                        context = "\n".join(context_parts)
                         # 在控制台打印当前 Milvus 检索并返回的结果数量
-                        print(f"[RAG] Milvus search returned {len(sources)} results. Query used: '{search_query}'")
+                        print(f"[[RAG STEP 7] Milvus search returned {len(sources)} results. Character length: {len(context)}")
+                        print(json.dumps(sources, ensure_ascii=False, indent=2))
+
                         # 返回包含拼接好的上下文 context 和数据源 sources 的字典
                         return {"context": context, "sources": sources}
         # 捕捉在 Milvus 查询或 MySQL 查询中发生的任何异常

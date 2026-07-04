@@ -2,7 +2,7 @@
 
 import { useChat } from 'ai/react'
 import { useEffect, useRef, type FormEvent } from 'react'
-import { Send, Square, Trash2, Zap, AlertCircle } from 'lucide-react'
+import { Send, Square, Plus, Zap, AlertCircle } from 'lucide-react'
 import { useRAG } from '@/contexts/RAGContext'
 import { useSession } from '@/contexts/SessionContext'
 import MessageItem from './MessageItem'
@@ -128,15 +128,14 @@ export default function ChatInterface() {
             </span>
           )} */}
         </div>
-        {messages.length > 0 && (
-          <button
-            onClick={clearHistory}
-            className="flex items-center gap-1.5 text-xs text-gray-500 hover:text-red-500 transition-colors"
-          >
-            <Trash2 className="w-3.5 h-3.5" />
-            清空对话
-          </button>
-        )}
+
+        <button
+          onClick={clearHistory}
+          className="flex items-center gap-1.5 text-xs text-gray-500 hover:text-blue-500 transition-colors"
+        >
+          <Plus className="w-3.5 h-3.5" />
+          新对话
+        </button>
       </header>
 
       {/* Messages */}

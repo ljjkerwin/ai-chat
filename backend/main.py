@@ -14,7 +14,7 @@ from db import (  # 从本地 db 模块导入数据库相关函数
     create_session, get_sessions, get_session_messages,  # 会话相关：创建会话、获取会话列表、获取会话消息
     add_session_message, delete_session_by_id,  # 会话相关：添加消息、删除会话
 )
-from rag import add_document, search_knowledge, delete_document, sync_sqlite_to_milvus  # 从本地 rag 模块导入相关函数
+from rag import add_document, search_knowledge, delete_document  # 从本地 rag 模块导入相关函数
 
 # Load env from project root's .env.local
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "..", ".env.local"))  # 加载项目根目录下 .env.local 文件中的环境变量
@@ -35,7 +35,12 @@ async def on_startup() -> None:  # 定义启动时执行 of 异步函数
     init_db()  # 初始化数据库（建表等）
     from db import initialize_incremental_stats
     initialize_incremental_stats()  # 初始化增量 BM25 统计信息
-    sync_sqlite_to_milvus()  # 同步 SQLite 中的已有向量数据至 Milvus
+
+
+@app.on_event("shutdown")
+async def on_shutdown() -> None:
+    from rag import close_http_client
+    await close_http_client()
 
 
 
@@ -103,6 +108,7 @@ async def chat(request: ChatRequest, tenant_id: str = Depends(get_current_tenant
             
             # 基于用户消息内容和历史上下文检索知识库
             rag = await search_knowledge(last_user.content, kb_id, tenant_id, chat_history=chat_history)  # 基于用户消息内容检索知识库
+
             if rag["context"]:  # 如果检索到了上下文内容
                 sources = rag["sources"]  # 保存检索到的来源列表
                 system_prompt = (  # 重新构造系统提示词，注入知识库内容
@@ -111,7 +117,7 @@ async def chat(request: ChatRequest, tenant_id: str = Depends(get_current_tenant
                     f"===知识库===\n{rag['context']}\n===END===\n\n请用中文回答。"  # 插入知识库内容并要求用中文回答
                 )
 
-    print(system_prompt)
+    # print(f"system_prompt: {system_prompt}")
 
     oai_messages = [{"role": "system", "content": system_prompt}] + [  # 构造发送给模型的消息列表，先放系统提示词
         {"role": m.role, "content": m.content} for m in request.messages  # 再依次附加用户传入的历史消息

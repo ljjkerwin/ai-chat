@@ -2,7 +2,7 @@
 
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
-import { MessageSquare, BookOpen, Zap, Database, Bot, Plus, Trash2 } from 'lucide-react'
+import { MessageSquare, BookOpen, Zap, Database, Bot, Trash2 } from 'lucide-react'
 import { useRAG } from '@/contexts/RAGContext'
 import { useSession } from '@/contexts/SessionContext'
 import { useEffect, useState } from 'react'
@@ -22,7 +22,7 @@ export default function Sidebar() {
     fetch(`/api/knowledge?kb_id=${activeKbId}`)
       .then(r => r.json())
       .then(d => setStats(d.stats))
-      .catch(() => {})
+      .catch(() => { })
   }, [pathname, kbId])
 
   useEffect(() => {
@@ -49,7 +49,7 @@ export default function Sidebar() {
           <Bot className="w-5 h-5 text-white" />
         </div>
         <div>
-          <p className="font-semibold text-gray-900 text-sm leading-tight">MiMo Chat</p>
+          <p className="font-semibold text-gray-900 text-sm leading-tight">AI Chat</p>
           <p className="text-xs text-gray-400">RAG 增强对话</p>
         </div>
       </div>
@@ -76,13 +76,6 @@ export default function Sidebar() {
       {/* Session history — only on /chat */}
       {isChat && (
         <div className="flex-1 flex flex-col min-h-0 p-3">
-          <button
-            onClick={() => switchSession(null)}
-            className="flex items-center gap-2 w-full px-3 py-2 mb-2 rounded-lg text-sm font-medium text-gray-700 hover:bg-gray-100 transition-colors"
-          >
-            <Plus className="w-4 h-4 shrink-0" />
-            新对话
-          </button>
 
           <div className="flex-1 overflow-y-auto space-y-0.5">
             {sessions.length === 0 ? (
