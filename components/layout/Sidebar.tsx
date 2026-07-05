@@ -125,6 +125,7 @@ export default function Sidebar() {
               )}
               role="switch"
               aria-checked={ragEnabled}
+              aria-label="RAG 增强"
             >
               <span
                 className={cn(

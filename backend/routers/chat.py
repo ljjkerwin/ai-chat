@@ -163,7 +163,7 @@ async def chat(request: ChatRequest, tenant_id: str = Depends(get_current_tenant
                     search_query = rewritten
                 else:
                     search_query = None
-                print(f"[RAG] Rewritten query: '{last_user.content}' -> '{search_query}'")
+                print(f"[RAG STEP 1] Rewritten query: '{last_user.content}' -> '{search_query}'")
             except Exception as e:
                 print(f"[RAG] Query rewriting failed: {e}")
                 search_query = last_user.content

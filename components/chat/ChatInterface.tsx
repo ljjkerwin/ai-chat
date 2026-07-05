@@ -211,6 +211,7 @@ export default function ChatInterface() {
             <button
               type="button"
               onClick={stop}
+              aria-label="停止生成"
               className="shrink-0 w-10 h-10 rounded-xl flex items-center justify-center bg-red-500 text-white hover:bg-red-600 transition-colors"
             >
               <Square className="w-4 h-4 fill-current" />
@@ -219,6 +220,7 @@ export default function ChatInterface() {
             <button
               type="submit"
               disabled={!input.trim()}
+              aria-label="发送消息"
               className={cn(
                 'shrink-0 w-10 h-10 rounded-xl flex items-center justify-center transition-colors',
                 input.trim()
@@ -255,7 +257,7 @@ function EmptyState({ ragEnabled }: { ragEnabled: boolean }) {
         <p className="text-sm text-gray-500 max-w-xs">
           {ragEnabled
             ? '已连接知识库，AI 将结合知识库内容回答您的问题'
-            : '在下方输入消息，与 MiMo 开始对话'}
+            : '在下方输入消息，与 AiBot 开始对话'}
         </p>
       </div>
       <div className="flex flex-wrap gap-2 justify-center">

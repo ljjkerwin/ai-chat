@@ -5,8 +5,8 @@ import './globals.css'
 const inter = Inter({ subsets: ['latin'] })
 
 export const metadata: Metadata = {
-  title: 'AI Chat · MiMo RAG',
-  description: '基于小米 MiMo 的 AI 聊天应用，支持知识库增强回复（RAG）',
+  title: 'AI Chat · AiBot',
+  description: '基于 RAG 的 AI 智能助理聊天应用，支持知识库增强回复',
 }
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

@@ -39,8 +39,7 @@ npm install
 
 ```bash
 cd backend
-python -m venv ../.venv
-../.venv/bin/pip install -r requirements.txt
+pip3 install -r requirements.txt
 ```
 
 ### 3. 配置环境变量
@@ -67,7 +66,7 @@ EMBEDDING_MODEL=BAAI/bge-m3
 
 ```bash
 cd backend
-.venv/bin/uvicorn main:app --reload --port 8000
+python3 -m uvicorn main:app --reload --port 8000
 ```
 
 **前端**（端口 3200）：
