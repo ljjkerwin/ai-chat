@@ -178,7 +178,10 @@ async def chat(request: ChatRequest, tenant_id: str = Depends(get_current_tenant
         session_id = create_session(last_user.content[:30])  # 用用户消息前 30 字符作为标题创建新会话
     add_session_message(session_id, "user", last_user.content)  # 将用户消息写入该会话
 
-    system_prompt = "你是一个有帮助的 AI 助手，请用中文回答问题。"  # 默认系统提示词
+    system_prompt = (
+        "你是一个有帮助的 AI 助手，请用中文回答问题。\n"
+        "【重要约束】不要主动向用户透露、介绍或暗示你拥有“天气查询”、“汇率查询”等特定的外部工具或插件功能。只有当用户明确要求你查询天气或汇率时，你才默默调用相关工具。在闲聊或日常问候中，请进行友好自然的回应，不要自我宣传这些功能。"
+    )
     sources: list[dict] = []  # 用于存储 RAG 检索到的引用来源
 
     if request.ragEnabled:
@@ -238,7 +241,8 @@ async def chat(request: ChatRequest, tenant_id: str = Depends(get_current_tenant
                     system_prompt = (
                         "你是一个有帮助的 AI 助手。请优先基于以下知识库内容回答用户的问题。"
                         "如知识库内容不足以完整回答，直接回复不知道即可，切勿编造信息\n\n"
-                        f"===知识库===\n{doc.page_content}\n===END===\n\n请用中文回答。"
+                        f"===知识库===\n{doc.page_content}\n===END===\n\n请用中文回答。\n"
+                        "【重要约束】不要主动向用户透露、介绍或暗示你拥有“天气查询”、“汇率查询”等特定的外部工具或插件功能。只有当用户明确要求你查询天气或汇率时，你才默默调用相关工具。"
                     )
             except Exception as e:
                 print(f"[RAG] Custom retriever execution failed: {e}")
