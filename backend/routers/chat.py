@@ -264,11 +264,66 @@ async def chat(request: ChatRequest, tenant_id: str = Depends(get_current_tenant
         ]
 
         try:
-            print("[chat] Invoking LLM with tools...")
-            response = await chat_llm_with_tools.ainvoke(messages)
+            print("[chat] Invoking LLM with tools (streaming)...")
+            tool_call_detected = False
+            text_buffer = ""
+            response_chunk = None
+
+            async for chunk in chat_llm_with_tools.astream(messages):
+                # print(f"chunk: {chunk}")
+                # 累加/合并所有流式 chunk，以便在循环结束后拼装成完整的 AIMessage 响应
+                if response_chunk is None:
+                    response_chunk = chunk
+                else:
+                    response_chunk += chunk
+
+                # 如果当前 chunk 包含工具调用片段，标记已检测到工具调用
+                if chunk.tool_call_chunks:
+                    tool_call_detected = True
+
+                # 如果当前 chunk 包含文本内容，则将其累加到文本缓存区
+                if chunk.content:
+                    text_buffer += chunk.content
+                    
+                    if not tool_call_detected:
+                        stripped_buffer = text_buffer.strip()
+                        # 如果缓存文本可能以 XML 标签开头（可能属于 XML 格式的工具调用）
+                        if stripped_buffer.startswith('<'):
+                            possible_prefixes = ["<tool_call", "<function", "<thinking"]
+                            # 判断当前缓存的文本是否为工具调用标签前缀的一部分
+                            is_prefix = any(p.startswith(stripped_buffer) or stripped_buffer.startswith(p) for p in possible_prefixes)
+                            # 如果不是合法的 XML 工具调用前缀，或者缓存内容过长（超过 200 字符），判定非工具调用，刷新缓存发送给前端
+                            if not is_prefix or len(text_buffer) > 200:
+                                yield f"0:{json.dumps(text_buffer, ensure_ascii=False)}\n"
+                                full_content += text_buffer
+                                text_buffer = ""
+                        else:
+                            # 如果显然不包含 XML 工具调用前缀，直接流式输出当前内容给前端
+                            yield f"0:{json.dumps(text_buffer, ensure_ascii=False)}\n"
+                            full_content += text_buffer
+                            text_buffer = ""
+
+            # 循环结束后，处理 buffer 中可能残留的文本内容
+            if text_buffer and not tool_call_detected:
+                # 双重检查：如果残留文本中包含 XML 格式的工具调用标识，则判定为触发了工具调用，不向用户直接输出
+                if "<tool_call>" in text_buffer or "<function=" in text_buffer:
+                    tool_call_detected = True
+                else:
+                    # 确认不是工具调用，将缓存中剩余的普通文本流式输出给前端
+                    yield f"0:{json.dumps(text_buffer, ensure_ascii=False)}\n"
+                    full_content += text_buffer
+                    text_buffer = ""
+
+            # print(f"[chat] response_chunk: {response_chunk}")
+
+            # 将流式响应的所有 chunk 融合成最终的 AIMessage，用作后续兼容判断及消息持久化
+            if response_chunk is None:
+                response = AIMessage(content="")
+            else:
+                response = response_chunk
             
             # 兼容处理：有些大模型在没有完全走 API 的 tool_calls 时，会以 XML 文本形式返回 tool call
-            if not response.tool_calls and response.content and "<tool_call>" in response.content:
+            if not response.tool_calls and response.content and ("<tool_call>" in response.content or "<function=" in response.content):
                 print(f"[chat] LLM返回了XML格式的tool call，处理兼容")
                 
                 # 解析 XML 格式的 tool call
@@ -329,23 +384,14 @@ async def chat(request: ChatRequest, tenant_id: str = Depends(get_current_tenant
                         )
                         messages.append(tool_message)
 
-                # formatted_msgs = "\n".join(
-                #     f"【{m.type.upper()}】\n{m.content}" + (f" (calls: {m.tool_calls})" if getattr(m, 'tool_calls', None) else "")
-                #     for m in messages
-                # )
-                # print(f"[RAG] final messages:\n{formatted_msgs}")
-
                 # Stream the final response from LLM using the tool output
                 async for chunk in chat_llm.astream(messages):
                     full_content += chunk.content
                     yield f"0:{json.dumps(chunk.content, ensure_ascii=False)}\n"
 
-            # 如果没有调用工具，则直接stream回答
+            # 如果没有调用工具，则说明在上面循环中已经把流输出完了，无需重复yield
             else:
-                print("[chat] 没有调用工具，则直接stream回答")
-                # No tool calls needed, stream/yield the response directly
-                full_content = response.content
-                yield f"0:{json.dumps(response.content, ensure_ascii=False)}\n"
+                print("[chat] 没有调用工具，流式输出已在上面处理完成")
 
 
         except Exception as e:

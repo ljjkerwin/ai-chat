@@ -283,7 +283,7 @@ function EmptyState({ ragEnabled }: { ragEnabled: boolean }) {
         <p className="text-sm text-gray-500 max-w-xs">
           {ragEnabled
             ? '已连接知识库，AI 将结合知识库内容回答您的问题'
-            : '在下方输入消息，与 AiBot 开始对话'}
+            : '在下方输入消息，与 AI 开始对话'}
         </p>
       </div>
       <div className="flex flex-wrap gap-2 justify-center">

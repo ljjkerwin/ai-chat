@@ -169,9 +169,9 @@ describe('Chat page integration tests', () => {
     mockChatState.error = null
     mockChatState.data = null
     listeners.clear()
-    
+
     mockStop.mockClear()
-    
+
     // Clear fetch and local storage mock
     fetchSpy.mockClear()
     window.localStorage.clear()
@@ -185,7 +185,7 @@ describe('Chat page integration tests', () => {
 
     // Since RAG is false by default, we expect default instructions in EmptyState
     await waitFor(() => {
-      expect(screen.getByText('在下方输入消息，与 AiBot 开始对话')).toBeInTheDocument()
+      expect(screen.getByText('在下方输入消息，与 AI 开始对话')).toBeInTheDocument()
       expect(screen.getByText('今天的天气怎样')).toBeInTheDocument()
     })
 
