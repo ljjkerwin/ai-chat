@@ -11,6 +11,8 @@ interface SessionContextValue {
   pendingMessages: SessionMessage[] | null
   switchSession: (id: string | null) => Promise<void>
   clearPendingMessages: () => void
+  sidebarOpen: boolean
+  setSidebarOpen: (open: boolean) => void
 }
 
 const SessionContext = createContext<SessionContextValue>({
@@ -21,12 +23,15 @@ const SessionContext = createContext<SessionContextValue>({
   pendingMessages: null,
   switchSession: async () => { },
   clearPendingMessages: () => { },
+  sidebarOpen: false,
+  setSidebarOpen: () => { },
 })
 
 export function SessionProvider({ children }: { children: ReactNode }) {
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(null)
   const [sessions, setSessions] = useState<Session[]>([])
   const [pendingMessages, setPendingMessages] = useState<SessionMessage[] | null>(null)
+  const [sidebarOpen, setSidebarOpen] = useState(false)
 
   const reloadSessions = useCallback(() => {
     fetch('/api/sessions')
@@ -44,6 +49,7 @@ export function SessionProvider({ children }: { children: ReactNode }) {
     const res = await fetch(`/api/sessions/${id}/messages`)
     const data = await res.json()
     setPendingMessages(data.messages ?? [])
+    setSidebarOpen(false) // Close sidebar drawer when switching session on mobile
   }, [])
 
   const clearPendingMessages = useCallback(() => setPendingMessages(null), [])
@@ -57,6 +63,8 @@ export function SessionProvider({ children }: { children: ReactNode }) {
       pendingMessages,
       switchSession,
       clearPendingMessages,
+      sidebarOpen,
+      setSidebarOpen,
     }}>
       {children}
     </SessionContext.Provider>

@@ -180,18 +180,13 @@ describe('Chat page integration tests', () => {
   it('renders initial empty state screen correctly', async () => {
     render(<TestChatApp />)
 
-    // Check header title
-    expect(screen.getByRole('heading', { name: 'AI 聊天' })).toBeInTheDocument()
-
-    // Check sidebar elements are rendered
-    expect(screen.getByText('AI Chat')).toBeInTheDocument()
-    expect(screen.getByText('RAG 增强')).toBeInTheDocument()
+    // Check header elements are rendered
+    expect(screen.getByRole('button', { name: /新对话/ })).toBeInTheDocument()
 
     // Since RAG is false by default, we expect default instructions in EmptyState
     await waitFor(() => {
-      expect(screen.getByText('开始对话')).toBeInTheDocument()
       expect(screen.getByText('在下方输入消息，与 AiBot 开始对话')).toBeInTheDocument()
-      expect(screen.getByText('你好，介绍一下自己')).toBeInTheDocument()
+      expect(screen.getByText('今天的天气怎样')).toBeInTheDocument()
     })
 
     // Expect input bar placeholder
@@ -280,7 +275,7 @@ describe('Chat page integration tests', () => {
 
     // Verify messages list is cleared, empty state shown
     expect(screen.queryByText('这是一条旧消息')).not.toBeInTheDocument()
-    expect(screen.getByText('开始对话')).toBeInTheDocument()
+    expect(screen.getByText('在下方输入消息，与 AiBot 开始对话')).toBeInTheDocument()
   })
 
   it('toggles RAG and shows changes in EmptyState and placeholders', async () => {
@@ -298,7 +293,6 @@ describe('Chat page integration tests', () => {
     await waitFor(() => {
       expect(window.localStorage.getItem('ragEnabled')).toBe('true')
       expect(screen.getByPlaceholderText('输入问题（将参考知识库）…')).toBeInTheDocument()
-      expect(screen.getByText('RAG 增强模式')).toBeInTheDocument()
       expect(screen.getByText('已连接知识库，AI 将结合知识库内容回答您的问题')).toBeInTheDocument()
     })
   })

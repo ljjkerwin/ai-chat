@@ -5,7 +5,7 @@ import './globals.css'
 const inter = Inter({ subsets: ['latin'] })
 
 export const metadata: Metadata = {
-  title: 'AI Chat · AiBot',
+  title: 'AI Chat',
   description: '基于 RAG 的 AI 智能助理聊天应用，支持知识库增强回复',
 }
 

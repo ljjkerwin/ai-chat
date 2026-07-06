@@ -1,13 +1,16 @@
 'use client'
 
 import { useState, useEffect, useCallback } from 'react'
-import { BookOpen, Plus, Trash2, FileText, Hash, Calendar, ChevronDown, ChevronUp, Loader2, FolderKanban } from 'lucide-react'
+import { BookOpen, Plus, Trash2, FileText, Hash, Calendar, ChevronDown, ChevronUp, Loader2, FolderKanban, Menu } from 'lucide-react'
 import { cn, formatDate, truncate } from '@/lib/utils'
 import type { KnowledgeDocument, KBStats } from '@/types'
 import { useRAG } from '@/contexts/RAGContext'
+import { useSession } from '@/contexts/SessionContext'
 
 export default function KnowledgeBase() {
   const { kbId, setKbId, knowledgeBases, refreshKBs } = useRAG()
+  const { setSidebarOpen } = useSession()
+  const [kbListOpen, setKbListOpen] = useState(false)
   const [docs, setDocs] = useState<KnowledgeDocument[]>([])
   const [stats, setStats] = useState<KBStats>({ docCount: 0, chunkCount: 0 })
   const [showForm, setShowForm] = useState(false)
@@ -92,9 +95,22 @@ export default function KnowledgeBase() {
   }
 
   return (
-    <div className="flex h-full bg-gray-50 overflow-hidden">
+    <div className="flex h-full bg-gray-50 overflow-hidden relative">
+      {/* KB List Sidebar Drawer Backdrop */}
+      {kbListOpen && (
+        <div
+          onClick={() => setKbListOpen(false)}
+          className="fixed inset-0 bg-black/40 z-30 lg:hidden transition-opacity duration-300"
+        />
+      )}
+
       {/* Left Column: KB list */}
-      <div className="w-64 shrink-0 bg-white border-r border-gray-200 flex flex-col h-full">
+      <div
+        className={cn(
+          "w-64 shrink-0 bg-white border-r border-gray-200 flex flex-col h-full fixed inset-y-0 left-0 z-40 transition-transform duration-300 ease-in-out lg:static lg:translate-x-0",
+          kbListOpen ? "translate-x-0" : "-translate-x-full"
+        )}
+      >
         <div className="p-4 border-b border-gray-100 flex items-center justify-between shrink-0">
           <h2 className="font-semibold text-gray-800 text-sm flex items-center gap-1.5">
             <FolderKanban className="w-4 h-4 text-blue-600" />
@@ -154,7 +170,7 @@ export default function KnowledgeBase() {
             return (
               <div
                 key={kb.id}
-                onClick={() => { setKbId(kb.id); setShowForm(false) }}
+                onClick={() => { setKbId(kb.id); setShowForm(false); setKbListOpen(false) }}
                 className={cn(
                   'group flex items-center justify-between p-2.5 rounded-lg cursor-pointer transition-colors relative',
                   isActive ? 'bg-blue-50 text-blue-700' : 'hover:bg-gray-50 text-gray-700'
@@ -187,24 +203,39 @@ export default function KnowledgeBase() {
       {/* Right Column: Doc list for active KB */}
       <div className="flex-1 flex flex-col h-full bg-white overflow-hidden">
         {/* Header */}
-        <header className="flex items-center justify-between px-6 py-3.5 bg-white border-b border-gray-200 shrink-0">
-          <div className="flex items-center gap-2">
-            <h1 className="font-semibold text-gray-900">{activeKb?.name || '加载中...'}</h1>
-            <span className="text-xs bg-gray-100 text-gray-600 px-2 py-0.5 rounded-full">
+        <header className="flex items-center justify-between px-4 lg:px-6 py-3.5 bg-white border-b border-gray-200 shrink-0">
+          <div className="flex items-center gap-2 min-w-0">
+            <button
+              onClick={() => setSidebarOpen(true)}
+              className="md:hidden p-1 mr-1 text-gray-500 hover:text-gray-900 hover:bg-gray-100 rounded-lg transition-colors shrink-0"
+              aria-label="打开菜单"
+            >
+              <Menu className="w-5 h-5" />
+            </button>
+            <button
+              onClick={() => setKbListOpen(true)}
+              className="lg:hidden p-1 mr-1 text-gray-500 hover:text-gray-900 hover:bg-gray-100 rounded-lg transition-colors shrink-0"
+              aria-label="打开知识库列表"
+            >
+              <FolderKanban className="w-5 h-5 text-blue-600" />
+            </button>
+            <h1 className="font-semibold text-gray-900 truncate max-w-[120px] md:max-w-xs">{activeKb?.name || '加载中...'}</h1>
+            <span className="text-xs bg-gray-100 text-gray-600 px-2 py-0.5 rounded-full shrink-0">
               {stats.docCount} 篇 · {stats.chunkCount} 片段
             </span>
           </div>
           <button
             onClick={() => setShowForm(v => !v)}
             disabled={!kbId}
-            className="flex items-center gap-1.5 text-sm bg-blue-600 text-white px-3 py-1.5 rounded-lg hover:bg-blue-700 transition-colors disabled:opacity-50"
+            className="flex items-center gap-1.5 text-xs md:text-sm bg-blue-600 text-white px-2.5 py-1.5 md:px-3 rounded-lg hover:bg-blue-700 transition-colors disabled:opacity-50 shrink-0"
           >
             <Plus className="w-4 h-4" />
-            添加文档
+            <span className="hidden sm:inline">添加文档</span>
+            <span className="sm:hidden">添加</span>
           </button>
         </header>
 
-        <div className="flex-1 overflow-y-auto p-6 space-y-4 bg-gray-50">
+        <div className="flex-1 overflow-y-auto p-4 md:p-6 space-y-4 bg-gray-50">
           {/* Upload form */}
           {showForm && kbId && (
             <UploadForm
@@ -363,7 +394,7 @@ function DocCard({ doc, onDelete }: { doc: KnowledgeDocument; onDelete: () => vo
           </div>
           <div className="min-w-0">
             <h3 className="font-medium text-gray-900 text-sm truncate">{doc.title}</h3>
-            <div className="flex items-center gap-3 mt-1 text-xs text-gray-400">
+            <div className="flex flex-wrap items-center gap-2 md:gap-3 mt-1 text-xs text-gray-400">
               <span className="flex items-center gap-1">
                 <Hash className="w-3 h-3" />
                 {doc.chunkCount} 个片段

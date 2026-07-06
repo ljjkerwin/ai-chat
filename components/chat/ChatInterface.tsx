@@ -2,7 +2,7 @@
 
 import { useChat } from 'ai/react'
 import { useEffect, useRef, type FormEvent } from 'react'
-import { Send, Square, Plus, Zap, AlertCircle } from 'lucide-react'
+import { Send, Square, Plus, Zap, AlertCircle, Menu } from 'lucide-react'
 import { useRAG } from '@/contexts/RAGContext'
 import { useSession } from '@/contexts/SessionContext'
 import MessageItem from './MessageItem'
@@ -17,6 +17,7 @@ export default function ChatInterface() {
     clearPendingMessages,
     reloadSessions,
     switchSession,
+    setSidebarOpen,
   } = useSession()
 
   const messagesEndRef = useRef<HTMLDivElement>(null)
@@ -137,9 +138,16 @@ export default function ChatInterface() {
   return (
     <div className="flex flex-col h-full">
       {/* Header */}
-      <header className="flex items-center justify-between px-6 py-3.5 bg-white border-b border-gray-200 shrink-0">
+      <header className="flex items-center justify-between px-4 md:px-6 py-3.5 bg-white border-b border-gray-200 shrink-0">
         <div className="flex items-center gap-2">
-          <h1 className="font-semibold text-gray-900">AI 聊天</h1>
+          <button
+            onClick={() => setSidebarOpen(true)}
+            className="md:hidden p-1 mr-1 text-gray-500 hover:text-gray-900 hover:bg-gray-100 rounded-lg transition-colors"
+            aria-label="打开侧边栏"
+          >
+            <Menu className="w-5 h-5" />
+          </button>
+          {/* <h1 className="font-semibold text-gray-900">AI 聊天</h1> */}
           {/* {ragEnabled && (
             <span className="flex items-center gap-1 text-xs bg-amber-100 text-amber-700 px-2 py-0.5 rounded-full font-medium">
               <Zap className="w-3 h-3" />
@@ -250,9 +258,9 @@ export default function ChatInterface() {
             </button>
           )}
         </form>
-        <p className="text-xs text-gray-400 mt-1.5 ml-1">
+        {/* <p className="text-xs text-gray-400 mt-1.5 ml-1">
           Enter 发送 · Shift+Enter 换行
-        </p>
+        </p> */}
       </div>
     </div>
   )
@@ -261,7 +269,7 @@ export default function ChatInterface() {
 function EmptyState({ ragEnabled }: { ragEnabled: boolean }) {
   const tips = ragEnabled
     ? ['知识库中有什么内容？', '请总结相关文档', '查找关于…的信息']
-    : ['你好，介绍一下自己', '帮我写一段代码', '解释一个概念']
+    : ['今天的天气怎样', '人民币兑韩元的汇率是多少']
 
   return (
     <div className="flex flex-col items-center justify-center h-full gap-6 px-4 text-center">
@@ -269,9 +277,9 @@ function EmptyState({ ragEnabled }: { ragEnabled: boolean }) {
         <div className="w-16 h-16 bg-blue-50 rounded-2xl flex items-center justify-center mx-auto mb-3">
           <Zap className={cn('w-8 h-8', ragEnabled ? 'text-amber-500' : 'text-blue-400')} />
         </div>
-        <h2 className="text-lg font-semibold text-gray-800 mb-1">
+        {/* <h2 className="text-lg font-semibold text-gray-800 mb-1">
           {ragEnabled ? 'RAG 增强模式' : '开始对话'}
-        </h2>
+        </h2> */}
         <p className="text-sm text-gray-500 max-w-xs">
           {ragEnabled
             ? '已连接知识库，AI 将结合知识库内容回答您的问题'
