@@ -302,4 +302,90 @@ describe('Chat page integration tests', () => {
       expect(screen.getByText('已连接知识库，AI 将结合知识库内容回答您的问题')).toBeInTheDocument()
     })
   })
+
+  it('allows typing during loading state and stopping with Escape key', async () => {
+    // Force loading state
+    mockChatState.isLoading = true
+    mockChatState.messages = [{ id: '1', role: 'user', content: '正在生成回答' }]
+    mockChatState.input = ''
+
+    render(<TestChatApp />)
+    const user = userEvent.setup()
+
+    const textarea = screen.getByPlaceholderText('输入消息…')
+    // Textarea should not be disabled
+    expect(textarea).not.toBeDisabled()
+
+    // Type while loading
+    await user.type(textarea, '新消息')
+    expect(textarea).toHaveValue('新消息')
+
+    // Press Escape to stop generation
+    await user.keyboard('{Escape}')
+    expect(mockStop).toHaveBeenCalledTimes(1)
+  })
+
+  it('restores active session from context if no session ID in URL query parameters', async () => {
+    let showChat = true
+    const { rerender } = render(
+      <RAGProvider>
+        <SessionProvider>
+          <div className="flex h-full">
+            <Sidebar />
+            {showChat && <ChatInterface />}
+          </div>
+        </SessionProvider>
+      </RAGProvider>
+    )
+    const user = userEvent.setup()
+
+    // Wait for sessions to load
+    await waitFor(() => {
+      expect(screen.getByText('关于 React 19 的讨论')).toBeInTheDocument()
+    })
+
+    // Click on session 1
+    const sessionLink = screen.getByText('关于 React 19 的讨论')
+    await user.click(sessionLink)
+
+    // Verify messages loaded
+    await waitFor(() => {
+      expect(screen.getByText('什么是 React 19?')).toBeInTheDocument()
+    })
+
+    // Unmount ChatInterface (navigate away to knowledge base)
+    showChat = false
+    rerender(
+      <RAGProvider>
+        <SessionProvider>
+          <div className="flex h-full">
+            <Sidebar />
+            {showChat && <ChatInterface />}
+          </div>
+        </SessionProvider>
+      </RAGProvider>
+    )
+
+    // Verify ChatInterface is not there
+    expect(screen.queryByPlaceholderText('输入消息…')).not.toBeInTheDocument()
+
+    // Mount ChatInterface again (navigate back to /chat)
+    showChat = true
+    rerender(
+      <RAGProvider>
+        <SessionProvider>
+          <div className="flex h-full">
+            <Sidebar />
+            {showChat && <ChatInterface />}
+          </div>
+        </SessionProvider>
+      </RAGProvider>
+    )
+
+    // ChatInterface mounts again. It should automatically restore the messages
+    await waitFor(() => {
+      expect(screen.getByText('什么是 React 19?')).toBeInTheDocument()
+      expect(screen.getByText('React 19 引入了 Server Components 和 Actions 等新特性。')).toBeInTheDocument()
+    })
+  })
 })

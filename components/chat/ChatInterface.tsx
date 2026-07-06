@@ -35,12 +35,18 @@ export default function ChatInterface() {
     setMessages,
     data,
   } = useChat({ api: `${process.env.NEXT_PUBLIC_BACKEND_URL ?? 'http://localhost:8000'}/api/chat` })
-
   // Restore session from URL on mount
   useEffect(() => {
     const params = new URLSearchParams(window.location.search)
     const sessionId = params.get('session')
-    if (sessionId) switchSession(sessionId)
+    if (sessionId) {
+      switchSession(sessionId)
+    } else if (currentSessionId) {
+      switchSession(currentSessionId)
+      const url = new URL(window.location.href)
+      url.searchParams.set('session', currentSessionId)
+      window.history.replaceState({}, '', url.toString())
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
@@ -87,6 +93,19 @@ export default function ChatInterface() {
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages, isLoading])
+
+  // Listen for Escape key globally to stop generation
+  useEffect(() => {
+    const handleGlobalKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && isLoading) {
+        stop()
+      }
+    }
+    window.addEventListener('keydown', handleGlobalKeyDown)
+    return () => {
+      window.removeEventListener('keydown', handleGlobalKeyDown)
+    }
+  }, [isLoading, stop])
 
   // Auto-resize textarea
   useEffect(() => {
@@ -204,7 +223,6 @@ export default function ChatInterface() {
                 'text-sm placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent',
                 'transition-colors'
               )}
-              disabled={isLoading}
             />
           </div>
           {isLoading ? (

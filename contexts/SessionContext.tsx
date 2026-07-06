@@ -15,12 +15,12 @@ interface SessionContextValue {
 
 const SessionContext = createContext<SessionContextValue>({
   currentSessionId: null,
-  setCurrentSessionId: () => {},
+  setCurrentSessionId: () => { },
   sessions: [],
-  reloadSessions: () => {},
+  reloadSessions: () => { },
   pendingMessages: null,
-  switchSession: async () => {},
-  clearPendingMessages: () => {},
+  switchSession: async () => { },
+  clearPendingMessages: () => { },
 })
 
 export function SessionProvider({ children }: { children: ReactNode }) {
@@ -32,7 +32,7 @@ export function SessionProvider({ children }: { children: ReactNode }) {
     fetch('/api/sessions')
       .then(r => r.json())
       .then(d => setSessions(d.sessions ?? []))
-      .catch(() => {})
+      .catch(() => { })
   }, [])
 
   const switchSession = useCallback(async (id: string | null) => {

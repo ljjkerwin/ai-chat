@@ -37,8 +37,18 @@ export default function Sidebar() {
   }
 
   const navItems = [
-    { href: '/chat', icon: MessageSquare, label: 'AI 聊天' },
-    { href: '/knowledge', icon: BookOpen, label: '知识库' },
+    {
+      href: currentSessionId ? `/chat?session=${currentSessionId}` : '/chat',
+      icon: MessageSquare,
+      label: 'AI 聊天',
+      active: pathname === '/chat'
+    },
+    {
+      href: '/knowledge',
+      icon: BookOpen,
+      label: '知识库',
+      active: pathname === '/knowledge' || pathname.startsWith('/knowledge/')
+    },
   ]
 
   return (
@@ -56,13 +66,13 @@ export default function Sidebar() {
 
       {/* Navigation */}
       <nav className="p-3 space-y-1 border-b border-gray-100">
-        {navItems.map(({ href, icon: Icon, label }) => (
+        {navItems.map(({ href, icon: Icon, label, active }) => (
           <Link
             key={href}
             href={href}
             className={cn(
               'flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors',
-              pathname === href || pathname.startsWith(href + '/')
+              active
                 ? 'bg-blue-50 text-blue-700'
                 : 'text-gray-600 hover:bg-gray-100 hover:text-gray-900'
             )}
@@ -136,11 +146,11 @@ export default function Sidebar() {
             </button>
           </div>
 
-          <p className="text-xs text-gray-500 leading-snug">
+          {/* <p className="text-xs text-gray-500 leading-snug">
             {ragEnabled
               ? '已开启：回复将参考知识库内容'
               : '已关闭：纯模型回复，不使用知识库'}
-          </p>
+          </p> */}
 
           {/* KB Dropdown Select */}
           {ragEnabled && knowledgeBases.length > 0 && (
