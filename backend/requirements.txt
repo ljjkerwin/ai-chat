@@ -12,5 +12,6 @@ langchain>=0.2.0
 langchain-core>=0.2.0
 langchain-openai>=0.1.0
 langchain-text-splitters>=0.2.0
+ddgs>=9.14.0
 
 
