@@ -19,7 +19,7 @@
 | 后端 | Python 3.11 · FastAPI · uvicorn |
 | 向量计算 | numpy (cosine similarity) |
 | 数据库 | SQLite（stdlib `sqlite3`） |
-| LLM | MiMo-7B-RL（或任意 OpenAI 兼容模型） |
+| LLM | mimo-v2.5（或任意 OpenAI 兼容模型） |
 | Embedding | BAAI/bge-m3（或 Gemini Embedding API） |
 
 ## 快速开始
@@ -50,7 +50,7 @@ pip3 install -r requirements.txt
 # 聊天模型（OpenAI 兼容接口）
 MIMO_BASE_URL=https://api.siliconflow.cn/v1
 MIMO_API_KEY=your_api_key
-MIMO_MODEL=Xiaomi/MiMo-7B-RL
+MIMO_MODEL=Xiaomi/mimo-v2.5
 
 # Embedding 模型（可选，不填则降级为关键词检索）
 EMBEDDING_BASE_URL=https://api.siliconflow.cn/v1

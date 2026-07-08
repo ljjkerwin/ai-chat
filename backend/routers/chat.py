@@ -15,6 +15,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
+from openai import AsyncOpenAI  # 导入原始异步 OpenAI 客户端用于捕获 reasoning_content
 
 from services.rag import RAGRetriever, validate_safe_id
 from services.db import create_session, add_session_message
@@ -27,7 +28,7 @@ load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "..", "..", ".en
 
 # Query Rewrite Model & Chain
 rewrite_llm = ChatOpenAI(
-    model=os.getenv("MIMO_MODEL", "Xiaomi/MiMo-7B-RL"),
+    model=os.getenv("MIMO_MODEL", "Xiaomi/mimo-v2.5"),
     openai_api_base=os.getenv("MIMO_BASE_URL", "https://api.siliconflow.cn/v1"),
     openai_api_key=os.getenv("MIMO_API_KEY", ""),
     temperature=0.3
@@ -67,8 +68,13 @@ rewrite_prompt_tmpl = ChatPromptTemplate.from_messages([
 rewrite_chain = rewrite_prompt_tmpl | rewrite_llm | StrOutputParser()
 
 # Main Chat Model & Chain
+raw_openai_client = AsyncOpenAI(
+    api_key=os.getenv("MIMO_API_KEY", ""),
+    base_url=os.getenv("MIMO_BASE_URL", "https://api.siliconflow.cn/v1")
+)
+
 chat_llm = ChatOpenAI(
-    model=os.getenv("MIMO_MODEL", "Xiaomi/MiMo-7B-RL"),
+    model=os.getenv("MIMO_MODEL", "Xiaomi/mimo-v2.5"),
     openai_api_base=os.getenv("MIMO_BASE_URL", "https://api.siliconflow.cn/v1"),
     openai_api_key=os.getenv("MIMO_API_KEY", ""),
     temperature=0.7
@@ -334,89 +340,103 @@ async def generate_chat_stream(
     """执行 LLM 调用与工具分发流，向调用方 yield (event_type, payload) 格式的数据。
     event_type 可以是 'text' 或 'error'
     """
-    messages = [
-        SystemMessage(content=system_prompt),
-        *chat_history_messages,
-        HumanMessage(content=last_user_content)
-    ]
-
-    print("[chat] Invoking LLM with tools (streaming)...")
-    tool_call_detected = False
-    text_buffer = ""
-    response_chunk = None
-
-    async for chunk in chat_llm_with_tools.astream(messages):
-        # 累加/合并所有流式 chunk
-        if response_chunk is None:
-            response_chunk = chunk
-        else:
-            response_chunk += chunk
-
-        # 如果当前 chunk 包含工具调用片段，标记已检测到工具调用
-        if chunk.tool_call_chunks:
-            tool_call_detected = True
-
-        # 如果当前 chunk 包含文本内容，则将其累加到文本缓存区
-        if chunk.content:
-            text_buffer += chunk.content
-            
-            if not tool_call_detected:
-                stripped_buffer = text_buffer.strip()
-                # 如果缓存文本可能以 XML 标签开头（可能属于 XML 格式的工具调用）
-                if stripped_buffer.startswith('<'):
-                    possible_prefixes = ["<tool_call", "<function", "<thinking"]
-                    is_prefix = any(p.startswith(stripped_buffer) or stripped_buffer.startswith(p) for p in possible_prefixes)
-                    # 如果不是合法的 XML 工具调用前缀，或者缓存内容过长（超过 200 字符），判定非工具调用，刷新缓存并输出
-                    if not is_prefix or len(text_buffer) > 200:
-                        yield "text", text_buffer
-                        text_buffer = ""
-                else:
-                    # 如果显然不包含 XML 工具调用前缀，直接流式输出当前内容给前端
-                    yield "text", text_buffer
-                    text_buffer = ""
-
-    # 处理 buffer 中可能残留的文本内容
-    if text_buffer and not tool_call_detected:
-        if "<tool_call>" in text_buffer or "<function=" in text_buffer:
-            tool_call_detected = True
-        else:
-            yield "text", text_buffer
-            text_buffer = ""
-
-    # 将流式响应的所有 chunk 融合成最终的 AIMessage
-    if response_chunk is None:
-        response = AIMessage(content="")
-    else:
-        response = response_chunk
+    model_name = os.getenv("MIMO_MODEL", "Xiaomi/mimo-v2.5")
     
-    # 兼容处理 XML 格式的 tool call
-    if not response.tool_calls and response.content and ("<tool_call>" in response.content or "<function=" in response.content):
-        print(f"[chat] LLM返回了XML格式的tool call，处理兼容")
-        parsed_calls = parse_xml_tool_calls(response.content)
-        if parsed_calls:
-            print(f"[chat] Parsed XML tool calls: {parsed_calls}")
-            response = AIMessage(
-                content="",
-                tool_calls=parsed_calls,
-                id=response.id,
-                response_metadata=response.response_metadata
-            )
-    
-    # 如果有调用工具，则调用工具完再stream最终回答
-    if response.tool_calls:
-        print(f"[chat] LLM返回示意工具调用: {response.tool_calls}")
-        messages.append(response)
-        
-        tool_messages = await execute_tools(response.tool_calls)
-        # 将工具的调用结果也发送给llm
-        for tool_msg in tool_messages:
-            messages.append(tool_msg)
+    # 格式化为 OpenAI API 所需 de messages
+    api_messages = [{"role": "system", "content": system_prompt}]
+    for msg in chat_history_messages:
+        role = "user" if msg.type == "human" else "assistant"
+        api_messages.append({"role": role, "content": msg.content})
+    api_messages.append({"role": "user", "content": last_user_content})
 
-        # Stream the final response from LLM using the tool output
-        async for chunk in chat_llm.astream(messages):
-            yield "text", chunk.content
-    else:
-        print("[chat] 没有调用工具，流式输出已在上面处理完成")
+    print(f"[chat] Invoking raw OpenAI API ({model_name}) for reasoning support...")
+    
+    # 检测是否为 mimo-v2.5 等推理模型以决定是否需要额外配置关闭思考
+    is_reasoning_model = "mimo-v2.5" in model_name.lower() or "mimo" in model_name.lower()
+    
+    extra_params = {
+        "temperature": 0.7
+    }
+    
+    if is_reasoning_model:
+        extra_params["extra_body"] = {
+            # "thinking": {
+            #     "type": "disabled"
+            # }
+        }
+
+    try:
+        response = await raw_openai_client.chat.completions.create(
+            model=model_name,
+            messages=api_messages,
+            stream=True,
+            **extra_params
+        )
+
+        in_thinking = False
+        async for chunk in response:
+            """
+            {
+                "id": "chatcmpl-12345",
+                "object": "chat.completion.chunk",
+                "created": 1720442288,
+                "model": "mimo-v2.5",
+                "choices": [
+                    {
+                    "index": 0,
+                    "delta": {
+                        "role": "assistant",        // 仅在第一个字块里返回
+                        "reasoning_content": "我们", // 如果是思考阶段，每次返回最新思考的字词
+                        "content": null             // 思考阶段正文通常为 null
+                    },
+                    "finish_reason": null
+                    }
+                ]
+            }
+            {
+                "choices": [
+                    {
+                    "index": 0,
+                    "delta": {
+                        "reasoning_content": null, // 思考结束，变为空
+                        "content": "等于 2"         // 开始返回正式回答的增量文本
+                    },
+                    "finish_reason": null
+                    }
+                ]
+            }
+            """
+            # 增量数据
+            delta = chunk.choices[0].delta if chunk.choices else None
+            if not delta:
+                continue
+
+            # 处理原生推理流字段 reasoning_content
+            reasoning = getattr(delta, "reasoning_content", None)
+            if reasoning is None and hasattr(delta, "model_extra") and delta.model_extra:
+                reasoning = delta.model_extra.get("reasoning_content")
+
+            if reasoning:
+                if not in_thinking:
+                    in_thinking = True
+                    yield "text", "<think>"
+                yield "text", reasoning
+
+            # 处理最终回复文本
+            content = getattr(delta, "content", None)
+            if content:
+                if in_thinking:
+                    in_thinking = False
+                    yield "text", "</think>"
+                yield "text", content
+
+        if in_thinking:
+            yield "text", "</think>"
+
+    except Exception as e:
+        print(f"[chat] Raw API generation failed: {e}")
+        # 如果是 RAG 检索异常或其它 API 报错，提供友好降级返回
+        yield "error", f"生错误: {str(e)}"
 
 
 # ── Router Setup ─────────────────────────────────────────────────────────
