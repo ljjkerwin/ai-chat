@@ -23,16 +23,16 @@ from services.rag import RAGRetriever, validate_safe_id
 from services.db import create_session, add_session_message
 from dependencies import get_current_tenant_id
 
-# Load env from project root's .env.local
+# Load env from project root's .env.local (triggered reload for Qwen)
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "..", "..", ".env.local"))  # 加载项目根目录下 .env.local 文件中的环境变量
 
 # ── LangChain Global Models & Chains Configuration ─────────────────────────
 
 # Query Rewrite Model & Chain
 rewrite_llm = ChatOpenAI(
-    model=os.getenv("MIMO_MODEL", "Xiaomi/mimo-v2.5"),
-    openai_api_base=os.getenv("MIMO_BASE_URL", "https://api.siliconflow.cn/v1"),
-    openai_api_key=os.getenv("MIMO_API_KEY", ""),
+    model=os.getenv("LLM_MODEL", "Xiaomi/mimo-v2.5"),
+    openai_api_base=os.getenv("LLM_BASE_URL", "https://api.siliconflow.cn/v1"),
+    openai_api_key=os.getenv("LLM_API_KEY", ""),
     temperature=0.3
 )
 
@@ -71,14 +71,14 @@ rewrite_chain = rewrite_prompt_tmpl | rewrite_llm | StrOutputParser()
 
 # Main Chat Model & Chain
 raw_openai_client = AsyncOpenAI(
-    api_key=os.getenv("MIMO_API_KEY", ""),
-    base_url=os.getenv("MIMO_BASE_URL", "https://api.siliconflow.cn/v1")
+    api_key=os.getenv("LLM_API_KEY", ""),
+    base_url=os.getenv("LLM_BASE_URL", "https://api.siliconflow.cn/v1")
 )
 
 chat_llm = ChatOpenAI(
-    model=os.getenv("MIMO_MODEL", "Xiaomi/mimo-v2.5"),
-    openai_api_base=os.getenv("MIMO_BASE_URL", "https://api.siliconflow.cn/v1"),
-    openai_api_key=os.getenv("MIMO_API_KEY", ""),
+    model=os.getenv("LLM_MODEL", "Xiaomi/mimo-v2.5"),
+    openai_api_base=os.getenv("LLM_BASE_URL", "https://api.siliconflow.cn/v1"),
+    openai_api_key=os.getenv("LLM_API_KEY", ""),
     temperature=0.7
 )
 
@@ -167,7 +167,46 @@ def web_search(query: str) -> str:
         return f"网页搜索失败，原因: {str(e)}"
 
 
-chat_llm_with_tools = chat_llm.bind_tools([get_current_weather, get_exchange_rate, web_search])
+@tool
+async def web_fetch(url: str) -> str:
+    """获取指定网页的文本内容。当需要读取或抓取某个特定网页、链接或 URL 的详细内容以回答用户问题时，使用此工具。"""
+    print(f"[Tool] web_fetch called with url='{url}'")
+    try:
+        import httpx
+        from bs4 import BeautifulSoup
+        
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+        async with httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=10.0) as client:
+            response = await client.get(url)
+            
+        if response.status_code != 200:
+            return f"获取网页内容失败，状态码: {response.status_code}"
+            
+        soup = BeautifulSoup(response.text, "html.parser")
+        
+        # 移除无用节点
+        for element in soup(["script", "style", "noscript", "iframe", "header", "footer", "nav"]):
+            element.decompose()
+            
+        text = soup.get_text(separator="\n")
+        
+        # 清理多余的空白字符和空行
+        lines = (line.strip() for line in text.splitlines())
+        chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+        text = "\n".join(chunk for chunk in chunks if chunk)
+        
+        max_len = 6000
+        if len(text) > max_len:
+            return text[:max_len] + "\n\n[内容过长，已被截断...]"
+        return text if text else "网页内容为空。"
+    except Exception as e:
+        print(f"[Tool] Web fetch failed: {e}")
+        return f"获取网页内容失败，原因: {str(e)}"
+
+
+chat_llm_with_tools = chat_llm.bind_tools([get_current_weather, get_exchange_rate, web_search, web_fetch])
 
 
 # ── Pydantic models ───────────────────────────────────────────────────────
@@ -361,7 +400,7 @@ async def generate_chat_stream(
     """执行 LLM 调用与工具分发流，向调用方 yield (event_type, payload) 格式的数据。
     event_type 可以是 'text' 或 'error'
     """
-    model_name = os.getenv("MIMO_MODEL", "Xiaomi/mimo-v2.5")
+    model_name = os.getenv("LLM_MODEL", "Xiaomi/mimo-v2.5")
     
     # 格式化为 OpenAI API 所需 de messages
     api_messages = [{"role": "system", "content": system_prompt}]
@@ -387,129 +426,157 @@ async def generate_chat_stream(
         }
 
     # 准备 OpenAI 格式的工具列表
-    tools_list = [get_current_weather, get_exchange_rate, web_search]
+    tools_list = [get_current_weather, get_exchange_rate, web_search, web_fetch]
     openai_tools = [convert_to_openai_tool(t) for t in tools_list]
 
+    tools_map = {
+        "get_current_weather": get_current_weather,
+        "get_exchange_rate": get_exchange_rate,
+        "web_search": web_search,
+        "web_fetch": web_fetch
+    }
+
     try:
-        response = await raw_openai_client.chat.completions.create(
-            model=model_name,
-            messages=api_messages,
-            stream=True,
-            tools=openai_tools,
-            **extra_params
-        )
+        current_turn = 0
+        max_turns = 5
 
-        in_thinking = False
-        tool_calls_accumulator = {}
-        accumulated_content = ""
-        text_buffer = ""
-        tool_call_detected = False
+        while current_turn < max_turns:
+            current_turn += 1
+            print(f"[chat] Turn {current_turn}: Invoking raw OpenAI API ({model_name})...")
 
-        async for chunk in response:
-            # 增量数据
-            delta = chunk.choices[0].delta if chunk.choices else None
-            if not delta:
-                continue
-
-            # 1. 收集标准的 OpenAI tool_calls
-            tool_calls = getattr(delta, "tool_calls", None)
-            if tool_calls:
-                tool_call_detected = True
-                for tc in tool_calls:
-                    idx = tc.index
-                    if idx not in tool_calls_accumulator:
-                        tool_calls_accumulator[idx] = {
-                            "id": tc.id,
-                            "name": tc.function.name if tc.function else "",
-                            "arguments": ""
+            # 在达到最大轮数限制时，强制关闭工具调用与思考
+            turn_params = extra_params.copy()
+            if current_turn < max_turns:
+                turn_tools = openai_tools
+            else:
+                turn_tools = None
+                if is_reasoning_model:
+                    turn_params["extra_body"] = {
+                        "thinking": {
+                            "type": "disabled"
                         }
-                    else:
-                        if tc.id:
-                            tool_calls_accumulator[idx]["id"] = tc.id
-                        if tc.function and tc.function.name:
-                            tool_calls_accumulator[idx]["name"] = tc.function.name
-                    
-                    if tc.function and tc.function.arguments:
-                        tool_calls_accumulator[idx]["arguments"] += tc.function.arguments
+                    }
 
-            # 2. 处理原生推理流字段 reasoning_content
-            reasoning = getattr(delta, "reasoning_content", None)
-            if reasoning is None and hasattr(delta, "model_extra") and delta.model_extra:
-                reasoning = delta.model_extra.get("reasoning_content")
+            response = await raw_openai_client.chat.completions.create(
+                model=model_name,
+                messages=api_messages,
+                stream=True,
+                tools=turn_tools,
+                **turn_params
+            )
 
-            if reasoning:
-                if not in_thinking:
-                    in_thinking = True
-                    yield "text", "<think>"
-                yield "text", reasoning
+            in_thinking = False
+            tool_calls_accumulator = {}
+            accumulated_content = ""
+            text_buffer = ""
+            tool_call_detected = False
 
-            # 3. 处理最终回复文本 (缓存处理以应对大模型返回的 XML 格式 tool call)
-            content = getattr(delta, "content", None)
-            if content:
-                if in_thinking:
-                    in_thinking = False
-                    yield "text", "</think>"
+            async for chunk in response:
+                delta = chunk.choices[0].delta if chunk.choices else None
+                if not delta:
+                    continue
 
-                accumulated_content += content
-                text_buffer += content
+                # 1. 收集标准的 OpenAI tool_calls
+                tool_calls = getattr(delta, "tool_calls", None)
+                if tool_calls:
+                    tool_call_detected = True
+                    for tc in tool_calls:
+                        idx = tc.index
+                        if idx not in tool_calls_accumulator:
+                            tool_calls_accumulator[idx] = {
+                                "id": tc.id,
+                                "name": tc.function.name if tc.function else "",
+                                "arguments": ""
+                            }
+                        else:
+                            if tc.id:
+                                tool_calls_accumulator[idx]["id"] = tc.id
+                            if tc.function and tc.function.name:
+                                tool_calls_accumulator[idx]["name"] = tc.function.name
+                        
+                        if tc.function and tc.function.arguments:
+                            tool_calls_accumulator[idx]["arguments"] += tc.function.arguments
 
-                if not tool_call_detected:
-                    stripped_buffer = text_buffer.strip()
-                    # 如果缓存文本可能以 XML 标签开头（可能属于 XML 格式的工具调用前缀）
-                    if stripped_buffer.startswith('<'):
-                        possible_prefixes = ["<tool_call", "<function", "<thinking"]
-                        is_prefix = any(p.startswith(stripped_buffer) or stripped_buffer.startswith(p) for p in possible_prefixes)
-                        # 如果不是合法的 XML 工具调用前缀，或者缓存内容过长，判定非工具调用，刷新缓存并向前端输出
-                        if not is_prefix or len(text_buffer) > 200:
+                # 2. 处理原生推理流字段 reasoning_content
+                reasoning = getattr(delta, "reasoning_content", None)
+                if reasoning is None and hasattr(delta, "model_extra") and delta.model_extra:
+                    reasoning = delta.model_extra.get("reasoning_content")
+
+                if reasoning:
+                    if not in_thinking:
+                        in_thinking = True
+                        yield "text", "<think>"
+                    yield "text", reasoning
+
+                # 3. 处理最终回复文本 (缓存处理以应对大模型返回的 XML 格式 tool call)
+                content = getattr(delta, "content", None)
+                if content:
+                    if in_thinking:
+                        in_thinking = False
+                        yield "text", "</think>"
+
+                    accumulated_content += content
+                    text_buffer += content
+
+                    if not tool_call_detected:
+                        stripped_buffer = text_buffer.strip()
+                        # 如果缓存文本可能以 XML 标签开头（可能属于 XML 格式的工具调用前缀）
+                        if stripped_buffer.startswith('<'):
+                            possible_prefixes = ["<tool_call", "<function", "<thinking"]
+                            is_prefix = any(p.startswith(stripped_buffer) or stripped_buffer.startswith(p) for p in possible_prefixes)
+                            # 如果不是合法的 XML 工具调用前缀，或者缓存内容过长，判定非工具调用，刷新缓存并向前端输出
+                            if not is_prefix or len(text_buffer) > 200:
+                                yield "text", text_buffer
+                                text_buffer = ""
+                        else:
+                            # 正常文本，直接流式输出
                             yield "text", text_buffer
                             text_buffer = ""
-                    else:
-                        # 正常文本，直接流式输出
-                        yield "text", text_buffer
-                        text_buffer = ""
 
-        if in_thinking:
-            yield "text", "</think>"
+            if in_thinking:
+                yield "text", "</think>"
 
-        # 处理可能残留的文本内容
-        if text_buffer and not tool_call_detected:
-            if "<tool_call>" in text_buffer or "<function=" in text_buffer:
+            # 处理可能残留的文本内容
+            if text_buffer and not tool_call_detected:
+                if "<tool_call>" in text_buffer or "<function=" in text_buffer:
+                    tool_call_detected = True
+                else:
+                    yield "text", text_buffer
+                    text_buffer = ""
+
+            # 4. 解析与合并所有的工具调用 (标准 OpenAI 格式 + 兼容性 XML 格式)
+            all_tool_calls = []
+
+            # 4.1 加入标准工具调用
+            if tool_calls_accumulator:
+                for idx, tc in sorted(tool_calls_accumulator.items()):
+                    try:
+                        args = json.loads(tc["arguments"]) if tc["arguments"] else {}
+                    except Exception:
+                        args = {}
+                    all_tool_calls.append({
+                        "id": tc["id"],
+                        "name": tc["name"],
+                        "args": args,
+                        "is_xml": False
+                    })
+
+            # 4.2 如果没有标准工具调用，尝试解析 XML 格式的工具调用
+            if not all_tool_calls and ("<tool_call>" in accumulated_content or "<function=" in accumulated_content):
                 tool_call_detected = True
-            else:
-                yield "text", text_buffer
-                text_buffer = ""
+                xml_calls = parse_xml_tool_calls(accumulated_content)
+                for xc in xml_calls:
+                    all_tool_calls.append({
+                        "id": xc["id"],
+                        "name": xc["name"],
+                        "args": xc["args"],
+                        "is_xml": True
+                    })
 
-        # 4. 解析与合并所有的工具调用 (标准 OpenAI 格式 + 兼容性 XML 格式)
-        all_tool_calls = []
+            # 5. 如果没有触发任何工具调用，说明已经生成了最终答案，退出循环
+            if not all_tool_calls:
+                break
 
-        # 4.1 加入标准工具调用
-        if tool_calls_accumulator:
-            for idx, tc in sorted(tool_calls_accumulator.items()):
-                try:
-                    args = json.loads(tc["arguments"]) if tc["arguments"] else {}
-                except Exception:
-                    args = {}
-                all_tool_calls.append({
-                    "id": tc["id"],
-                    "name": tc["name"],
-                    "args": args,
-                    "is_xml": False
-                })
-
-        # 4.2 如果没有标准工具调用，尝试解析 XML 格式的工具调用
-        if not all_tool_calls and ("<tool_call>" in accumulated_content or "<function=" in accumulated_content):
-            tool_call_detected = True
-            xml_calls = parse_xml_tool_calls(accumulated_content)
-            for xc in xml_calls:
-                all_tool_calls.append({
-                    "id": xc["id"],
-                    "name": xc["name"],
-                    "args": xc["args"],
-                    "is_xml": True
-                })
-
-        # 5. 如果触发了工具调用，则执行并递归再次调用大模型获取最终回答
-        if all_tool_calls:
             # 格式化 assistant 的 tool_calls
             openai_tool_calls = []
             for tc in all_tool_calls:
@@ -535,12 +602,6 @@ async def generate_chat_stream(
             api_messages.append(assistant_msg)
 
             # 并行执行匹配到的工具
-            tools_map = {
-                "get_current_weather": get_current_weather,
-                "get_exchange_rate": get_exchange_rate,
-                "web_search": web_search
-            }
-
             tasks = []
             matched_calls = []
             for tc in all_tool_calls:
@@ -560,31 +621,12 @@ async def generate_chat_stream(
                         "tool_call_id": tc["id"],
                         "content": str(output)
                     })
-
-            # 再次发起 LLM 调用，生成最终答复
-            print(f"[chat] Invoking raw OpenAI API again with tool outputs...")
-            extra_params_tool = extra_params.copy()
-            if is_reasoning_model:
-                extra_params_tool["extra_body"] = {
-                    "thinking": {
-                        "type": "disabled"
-                    }
-                }
-
-            final_response = await raw_openai_client.chat.completions.create(
-                model=model_name,
-                messages=api_messages,
-                stream=True,
-                **extra_params_tool
-            )
-
-            async for chunk in final_response:
-                delta = chunk.choices[0].delta if chunk.choices else None
-                if not delta:
-                    continue
-                content = getattr(delta, "content", None)
-                if content:
-                    yield "text", content
+            else:
+                # 如果有工具调用但没有匹配到任何后端工具，为了避免死循环，直接返回内容并退出
+                print(f"[chat] Warning: No matched tool functions for calls: {[tc['name'] for tc in all_tool_calls]}")
+                if accumulated_content:
+                    yield "text", accumulated_content
+                break
 
     except Exception as e:
         print(f"[chat] Raw API generation failed: {e}")

@@ -48,9 +48,9 @@ pip3 install -r requirements.txt
 
 ```env
 # 聊天模型（OpenAI 兼容接口）
-MIMO_BASE_URL=https://api.siliconflow.cn/v1
-MIMO_API_KEY=your_api_key
-MIMO_MODEL=Xiaomi/mimo-v2.5
+LLM_BASE_URL=https://api.siliconflow.cn/v1
+LLM_API_KEY=your_api_key
+LLM_MODEL=Xiaomi/mimo-v2.5
 
 # Embedding 模型（可选，不填则降级为关键词检索）
 EMBEDDING_BASE_URL=https://api.siliconflow.cn/v1

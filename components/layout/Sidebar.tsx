@@ -73,7 +73,7 @@ export default function Sidebar() {
           </div>
           <div>
             <p className="font-semibold text-gray-900 text-sm leading-tight">AI Chat</p>
-            <p className="text-xs text-gray-400">RAG 增强对话</p>
+            <p className="text-xs text-gray-400">RAG + Tools</p>
           </div>
         </div>
 
