@@ -420,9 +420,9 @@ async def generate_chat_stream(
     
     if is_reasoning_model:
         extra_params["extra_body"] = {
-            # "thinking": {
-            #     "type": "disabled"
-            # }
+            "thinking": {
+                "type": "disabled"
+            }
         }
 
     # 准备 OpenAI 格式的工具列表
@@ -440,11 +440,12 @@ async def generate_chat_stream(
         current_turn = 0
         max_turns = 5
 
+        # 循环调用大模型，最多支持 5 轮的 Tool Call / 思考交互（ReAct 循环）
         while current_turn < max_turns:
             current_turn += 1
             print(f"[chat] Turn {current_turn}: Invoking raw OpenAI API ({model_name})...")
 
-            # 在达到最大轮数限制时，强制关闭工具调用与思考
+            # 在达到最大轮数限制时，强制关闭工具调用与思考，避免产生死循环
             turn_params = extra_params.copy()
             if current_turn < max_turns:
                 turn_tools = openai_tools
@@ -456,7 +457,8 @@ async def generate_chat_stream(
                             "type": "disabled"
                         }
                     }
-
+            
+            # 异步请求大模型的流式 chat completions 接口
             response = await raw_openai_client.chat.completions.create(
                 model=model_name,
                 messages=api_messages,
@@ -465,18 +467,24 @@ async def generate_chat_stream(
                 **turn_params
             )
 
+            # 标识当前是否正处于模型的思维链/深度思考输出状态
             in_thinking = False
+            # 累加与拼接标准 OpenAI 格式工具调用的字典，键为 tool_call 的 index，值为字典：{"id", "name", "arguments"}
             tool_calls_accumulator = {}
+            # 累积记录模型本轮返回的完整正文内容，后续用于解析可能存在的 XML 格式工具调用
             accumulated_content = ""
+            # 临时文本缓冲区，用来拦截并延迟流式输出可能是 XML 标签的文本前缀（如 "<tool_call"）
             text_buffer = ""
+            # 标识本轮是否检测到了工具调用（包括标准工具调用与 XML 格式工具调用前缀），用于控制正文输出
             tool_call_detected = False
 
+            # 流式处理响应数据包 (Chunk)
             async for chunk in response:
                 delta = chunk.choices[0].delta if chunk.choices else None
                 if not delta:
                     continue
 
-                # 1. 收集标准的 OpenAI tool_calls
+                # 1. 收集并拼接标准的 OpenAI tool_calls 信息
                 tool_calls = getattr(delta, "tool_calls", None)
                 if tool_calls:
                     tool_call_detected = True
@@ -497,20 +505,22 @@ async def generate_chat_stream(
                         if tc.function and tc.function.arguments:
                             tool_calls_accumulator[idx]["arguments"] += tc.function.arguments
 
-                # 2. 处理原生推理流字段 reasoning_content
+                # 2. 处理原生推理流字段 reasoning_content（例如 DeepSeek r1 的思维链内容）
                 reasoning = getattr(delta, "reasoning_content", None)
                 if reasoning is None and hasattr(delta, "model_extra") and delta.model_extra:
                     reasoning = delta.model_extra.get("reasoning_content")
 
                 if reasoning:
+                    # 如果还未发送过开始思考的标签，则先流式输出 <think> 标识
                     if not in_thinking:
                         in_thinking = True
                         yield "text", "<think>"
                     yield "text", reasoning
 
-                # 3. 处理最终回复文本 (缓存处理以应对大模型返回的 XML 格式 tool call)
+                # 3. 处理最终回复文本 (缓存处理以应对大模型返回的 XML 格式 tool call，避免其泄露给用户)
                 content = getattr(delta, "content", None)
                 if content:
+                    # 如果之前在思考，现在切换到正文，先输出闭合标签 </think>
                     if in_thinking:
                         in_thinking = False
                         yield "text", "</think>"
@@ -518,26 +528,29 @@ async def generate_chat_stream(
                     accumulated_content += content
                     text_buffer += content
 
+                    # 如果尚未检测到标准的 tool_call，需提防本段文本是否是模型在吐 XML 标签格式的自定义工具调用
                     if not tool_call_detected:
                         stripped_buffer = text_buffer.strip()
                         # 如果缓存文本可能以 XML 标签开头（可能属于 XML 格式的工具调用前缀）
                         if stripped_buffer.startswith('<'):
                             possible_prefixes = ["<tool_call", "<function", "<thinking"]
                             is_prefix = any(p.startswith(stripped_buffer) or stripped_buffer.startswith(p) for p in possible_prefixes)
-                            # 如果不是合法的 XML 工具调用前缀，或者缓存内容过长，判定非工具调用，刷新缓存并向前端输出
+                            # 如果不是合法的 XML 工具调用前缀，或者缓存内容过长（>200字符），判定非工具调用，刷新缓存并向前端流式输出
                             if not is_prefix or len(text_buffer) > 200:
                                 yield "text", text_buffer
                                 text_buffer = ""
                         else:
-                            # 正常文本，直接流式输出
+                            # 正常文本内容，直接流式发送给前端
                             yield "text", text_buffer
                             text_buffer = ""
 
+            # 流式结束时，如果还在思考模式中，补充闭合标签
             if in_thinking:
                 yield "text", "</think>"
 
             # 处理可能残留的文本内容
             if text_buffer and not tool_call_detected:
+                # 检查残留的缓冲区里是否包含 XML 工具调用的特定节点
                 if "<tool_call>" in text_buffer or "<function=" in text_buffer:
                     tool_call_detected = True
                 else:
@@ -547,7 +560,7 @@ async def generate_chat_stream(
             # 4. 解析与合并所有的工具调用 (标准 OpenAI 格式 + 兼容性 XML 格式)
             all_tool_calls = []
 
-            # 4.1 加入标准工具调用
+            # 4.1 提取与组装标准 OpenAI 格式的工具调用
             if tool_calls_accumulator:
                 for idx, tc in sorted(tool_calls_accumulator.items()):
                     try:
@@ -561,7 +574,7 @@ async def generate_chat_stream(
                         "is_xml": False
                     })
 
-            # 4.2 如果没有标准工具调用，尝试解析 XML 格式的工具调用
+            # 4.2 如果没有标准工具调用，尝试解析 XML 格式的工具调用（支持某些模型自定义输出的 XML 片段）
             if not all_tool_calls and ("<tool_call>" in accumulated_content or "<function=" in accumulated_content):
                 tool_call_detected = True
                 xml_calls = parse_xml_tool_calls(accumulated_content)
@@ -573,11 +586,11 @@ async def generate_chat_stream(
                         "is_xml": True
                     })
 
-            # 5. 如果没有触发任何工具调用，说明已经生成了最终答案，退出循环
+            # 5. 如果本次大模型输出没有触发任何工具调用，说明已经生成了最终答案，退出 ReAct 循环
             if not all_tool_calls:
                 break
 
-            # 格式化 assistant 的 tool_calls
+            # 格式化 assistant 的 tool_calls，将其转为 OpenAI 标准的格式对象
             openai_tool_calls = []
             for tc in all_tool_calls:
                 openai_tool_calls.append({
@@ -599,9 +612,10 @@ async def generate_chat_stream(
                 # 且标准调用下，assistant content 最好为空或前置思考内容（移除 XML 字段）
                 assistant_msg["content"] = ""
 
+            # 将 assistant 响应（包含 tool_calls）追加到当前上下文消息中
             api_messages.append(assistant_msg)
 
-            # 并行执行匹配到的工具
+            # 筛选出有对应后端映射实现的工具，准备并行执行
             tasks = []
             matched_calls = []
             for tc in all_tool_calls:
@@ -611,9 +625,11 @@ async def generate_chat_stream(
                     tasks.append(tool_func.ainvoke(tc["args"]))
                     matched_calls.append(tc)
 
+            # 并行执行匹配到的后端工具
             if tasks:
                 print(f"[chat] Executing tools: {[tc['name'] for tc in matched_calls]}")
                 results = await asyncio.gather(*tasks)
+                # 将工具执行结果作为 role="tool" 的消息依次追加入上下文
                 for tc, output in zip(matched_calls, results):
                     api_messages.append({
                         "role": "tool",
@@ -621,11 +637,18 @@ async def generate_chat_stream(
                         "tool_call_id": tc["id"],
                         "content": str(output)
                     })
+
+                # 查看本轮所有消息
+                print("\n\n".join(str(i) for i in api_messages))
+
             else:
                 # 如果有工具调用但没有匹配到任何后端工具，为了避免死循环，直接返回内容并退出
                 print(f"[chat] Warning: No matched tool functions for calls: {[tc['name'] for tc in all_tool_calls]}")
                 if accumulated_content:
                     yield "text", accumulated_content
+
+                # 查看本轮所有消息
+                print("\n\n".join(str(i) for i in api_messages))
                 break
 
     except Exception as e:
