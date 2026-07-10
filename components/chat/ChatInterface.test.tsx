@@ -129,7 +129,13 @@ const fetchSpy = vi.spyOn(window, 'fetch').mockImplementation((url) => {
   if (urlStr.includes('/api/sessions') && (urlStr.endsWith('/api/sessions') || urlStr.includes('/api/sessions?'))) {
     return Promise.resolve({
       ok: true,
-      json: () => Promise.resolve({ sessions: mockSessions })
+      json: () => Promise.resolve({
+        sessions: mockSessions,
+        page: 1,
+        page_size: 30,
+        total: mockSessions.length,
+        has_more: false
+      })
     } as Response)
   }
   if (urlStr.includes('/api/knowledge')) {
@@ -275,7 +281,7 @@ describe('Chat page integration tests', () => {
 
     // Verify messages list is cleared, empty state shown
     expect(screen.queryByText('这是一条旧消息')).not.toBeInTheDocument()
-    expect(screen.getByText('在下方输入消息，与 AiBot 开始对话')).toBeInTheDocument()
+    expect(screen.getByText('在下方输入消息，与 AI 开始对话')).toBeInTheDocument()
   })
 
   it('toggles RAG and shows changes in EmptyState and placeholders', async () => {

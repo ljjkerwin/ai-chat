@@ -2,6 +2,7 @@ from fastapi import APIRouter  # 导入 APIRouter
 
 from services.db import (  # 从本地 db 模块导入会话相关数据库函数
     get_sessions,
+    get_sessions_count,
     get_session_messages,
     delete_session_by_id,
 )
@@ -14,8 +15,21 @@ router = APIRouter()
 # ── Session endpoints ─────────────────────────────────────────────────────
 
 @router.get("/api/sessions")  # 注册 GET /api/sessions 路由
-def list_sessions():  # 获取会话列表的处理函数
-    return {"sessions": get_sessions()}  # 返回所有会话
+def list_sessions(page: int = 1, page_size: int = 30):  # 获取会话列表的处理函数，支持分页获取
+    if page < 1:
+        page = 1
+    if page_size < 1:
+        page_size = 30
+    offset = (page - 1) * page_size
+    sessions = get_sessions(limit=page_size, offset=offset)
+    total = get_sessions_count()
+    return {
+        "sessions": sessions,
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "has_more": offset + len(sessions) < total
+    }
 
 
 @router.get("/api/sessions/{session_id}/messages")  # 注册 GET /api/sessions/{session_id}/messages 路由

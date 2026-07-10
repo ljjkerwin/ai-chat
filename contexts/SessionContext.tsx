@@ -13,6 +13,9 @@ interface SessionContextValue {
   clearPendingMessages: () => void
   sidebarOpen: boolean
   setSidebarOpen: (open: boolean) => void
+  hasMore: boolean
+  loadingMore: boolean
+  loadMoreSessions: () => Promise<void>
 }
 
 const SessionContext = createContext<SessionContextValue>({
@@ -25,6 +28,9 @@ const SessionContext = createContext<SessionContextValue>({
   clearPendingMessages: () => { },
   sidebarOpen: false,
   setSidebarOpen: () => { },
+  hasMore: false,
+  loadingMore: false,
+  loadMoreSessions: async () => { },
 })
 
 export function SessionProvider({ children }: { children: ReactNode }) {
@@ -32,13 +38,42 @@ export function SessionProvider({ children }: { children: ReactNode }) {
   const [sessions, setSessions] = useState<Session[]>([])
   const [pendingMessages, setPendingMessages] = useState<SessionMessage[] | null>(null)
   const [sidebarOpen, setSidebarOpen] = useState(false)
+  const [page, setPage] = useState(1)
+  const [hasMore, setHasMore] = useState(true)
+  const [loadingMore, setLoadingMore] = useState(false)
 
   const reloadSessions = useCallback(() => {
-    fetch('/api/sessions')
+    setPage(1)
+    setHasMore(true)
+    fetch('/api/sessions?page=1&page_size=30')
       .then(r => r.json())
-      .then(d => setSessions(d.sessions ?? []))
+      .then(d => {
+        setSessions(d.sessions ?? [])
+        setHasMore(d.has_more ?? false)
+      })
       .catch(() => { })
   }, [])
+
+  const loadMoreSessions = useCallback(async () => {
+    if (loadingMore || !hasMore) return
+    setLoadingMore(true)
+    try {
+      const nextPage = page + 1
+      const res = await fetch(`/api/sessions?page=${nextPage}&page_size=30`)
+      const d = await res.json()
+      setSessions(prev => {
+        const existingIds = new Set(prev.map(s => s.id))
+        const newSessions = (d.sessions ?? []).filter((s: Session) => !existingIds.has(s.id))
+        return [...prev, ...newSessions]
+      })
+      setPage(nextPage)
+      setHasMore(d.has_more ?? false)
+    } catch (err) {
+      console.error('Failed to load more sessions:', err)
+    } finally {
+      setLoadingMore(false)
+    }
+  }, [page, hasMore, loadingMore])
 
   const switchSession = useCallback(async (id: string | null) => {
     setCurrentSessionId(id)
@@ -65,6 +100,9 @@ export function SessionProvider({ children }: { children: ReactNode }) {
       clearPendingMessages,
       sidebarOpen,
       setSidebarOpen,
+      hasMore,
+      loadingMore,
+      loadMoreSessions,
     }}>
       {children}
     </SessionContext.Provider>

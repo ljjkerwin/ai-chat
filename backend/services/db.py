@@ -325,7 +325,7 @@ def create_session(title: str) -> str:
     return session_id
 
 
-def get_sessions() -> list[dict]:
+def get_sessions(limit: int = 30, offset: int = 0) -> list[dict]:
     with get_conn() as conn:
         with conn.cursor() as cursor:
             cursor.execute("""
@@ -335,9 +335,18 @@ def get_sessions() -> list[dict]:
                 LEFT JOIN session_messages m ON m.session_id = s.id
                 GROUP BY s.id, s.title, s.created_at, s.updated_at
                 ORDER BY s.updated_at DESC
-            """)
+                LIMIT %s OFFSET %s
+            """, (limit, offset))
             rows = cursor.fetchall()
     return [dict(r) for r in rows]
+
+
+def get_sessions_count() -> int:
+    with get_conn() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT COUNT(*) as count FROM sessions")
+            row = cursor.fetchone()
+            return row["count"] if row else 0
 
 
 def get_session_messages(session_id: str) -> list[dict]:
