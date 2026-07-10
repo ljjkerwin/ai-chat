@@ -65,7 +65,7 @@ export default function MessageItem({ role, content, isStreaming }: MessageItemP
   // 当有思考内容，且消息气泡内容为空，并且消息还在接收中时，依然展示思考中状态（因为有可能下一轮消息内容也需要思考）
   const isThinking = parsedIsThinking || !!(isStreaming && !response && thinking)
 
-  // 控制思考折叠面板的展开状态，默认不需要展开思考内容
+  // 控制思考折叠面板的展开状态，默认不展开
   const [isExpanded, setIsExpanded] = useState(false)
 
   return (
@@ -115,11 +115,10 @@ export default function MessageItem({ role, content, isStreaming }: MessageItemP
 
             {/* 折叠栏内容 */}
             {isExpanded && (
-              <div className="px-3 pb-3 pt-0 text-gray-500 border-t border-gray-100/50 whitespace-pre-wrap leading-relaxed">
-                {thinking}
-                {isThinking && isStreaming && (
-                  <span className="inline-block w-1 h-3.5 bg-gray-400 ml-0.5 animate-pulse rounded-sm" />
-                )}
+              <div className="px-3 pb-3 pt-2 text-gray-500 border-t border-gray-100/50 leading-relaxed">
+                <div className="prose-thinking">
+                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{thinking}</ReactMarkdown>
+                </div>
               </div>
             )}
           </div>
@@ -140,9 +139,6 @@ export default function MessageItem({ role, content, isStreaming }: MessageItemP
             ) : response ? (
               <div className="prose-chat">
                 <ReactMarkdown remarkPlugins={[remarkGfm]}>{response}</ReactMarkdown>
-                {isStreaming && (
-                  <span className="inline-block w-1.5 h-4 bg-gray-400 ml-0.5 animate-pulse rounded-sm" />
-                )}
               </div>
             ) : (
               // 当消息气泡还没有内容且消息还在接收中时，显示loading

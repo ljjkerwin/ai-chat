@@ -388,4 +388,48 @@ describe('Chat page integration tests', () => {
       expect(screen.getByText('React 19 引入了 Server Components 和 Actions 等新特性。')).toBeInTheDocument()
     })
   })
+
+  it('calls stop when component is unmounted', () => {
+    mockChatState.isLoading = true
+    mockStop.mockClear()
+
+    const { unmount } = render(<TestChatApp />)
+    unmount()
+
+    expect(mockStop).toHaveBeenCalledTimes(1)
+  })
+
+  it('calls stop when switching sessions', async () => {
+    mockChatState.isLoading = true
+    mockStop.mockClear()
+
+    render(<TestChatApp />)
+    const user = userEvent.setup()
+
+    // Wait for sessions to load
+    await waitFor(() => {
+      expect(screen.getByText('关于 React 19 的讨论')).toBeInTheDocument()
+    })
+
+    // Click on a session
+    const sessionLink = screen.getByText('关于 React 19 的讨论')
+    await user.click(sessionLink)
+
+    // Verify stop was called during switching
+    expect(mockStop).toHaveBeenCalled()
+  })
+
+  it('calls stop when clicking "新对话" (new chat)', async () => {
+    mockChatState.isLoading = true
+    mockStop.mockClear()
+
+    render(<TestChatApp />)
+    const user = userEvent.setup()
+
+    const newChatBtn = screen.getByRole('button', { name: /新对话/ })
+    await user.click(newChatBtn)
+
+    expect(mockStop).toHaveBeenCalled()
+  })
 })
+

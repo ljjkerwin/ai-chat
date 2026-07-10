@@ -69,12 +69,20 @@ export default function ChatInterface() {
   // Load messages when switching sessions
   useEffect(() => {
     if (pendingMessages === null) return
+    stop() // Abort active streaming if we switch session
     setMessages(
       pendingMessages.map(m => ({ id: m.id, role: m.role, content: m.content }))
     )
     prevDataLen.current = 0
     clearPendingMessages()
-  }, [pendingMessages, setMessages, clearPendingMessages])
+  }, [pendingMessages, setMessages, clearPendingMessages, stop])
+
+  // Abort active generation on component unmount (e.g. navigating away)
+  useEffect(() => {
+    return () => {
+      stop()
+    }
+  }, [stop])
 
   // Extract sessionId from data stream
   useEffect(() => {
@@ -130,6 +138,7 @@ export default function ChatInterface() {
   }
 
   const clearHistory = () => {
+    stop() // Abort active generation when starting a new chat
     setMessages([])
     setCurrentSessionId(null)
     prevDataLen.current = 0
