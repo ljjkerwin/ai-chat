@@ -15,14 +15,14 @@ router = APIRouter()
 # ── Session endpoints ─────────────────────────────────────────────────────
 
 @router.get("/api/sessions")  # 注册 GET /api/sessions 路由
-def list_sessions(page: int = 1, page_size: int = 30):  # 获取会话列表的处理函数，支持分页获取
+def list_sessions(page: int = 1, page_size: int = 30, agent_type: str = "1"):  # 获取会话列表的处理函数，支持分页获取
     if page < 1:
         page = 1
     if page_size < 1:
         page_size = 30
     offset = (page - 1) * page_size
-    sessions = get_sessions(limit=page_size, offset=offset)
-    total = get_sessions_count()
+    sessions = get_sessions(limit=page_size, offset=offset, agent_type=agent_type)
+    total = get_sessions_count(agent_type=agent_type)
     return {
         "sessions": sessions,
         "page": page,

@@ -3,7 +3,8 @@ import asyncio
 import json  # 导入 json 模块，用于序列化流式响应数据
 import os  # 导入 os 模块，用于读取环境变量和处理文件路径
 import re
-from typing import AsyncGenerator, Optional  # 导入类型提示：异步生成器和可选类型
+from typing import AsyncGenerator, Optional, TypedDict  # 导入类型提示：异步生成器、可选类型和 TypedDict
+
 
 from dotenv import load_dotenv  # 导入 dotenv，用于从 .env 文件加载环境变量
 from fastapi import APIRouter, HTTPException, Depends  # 导入 APIRouter, HTTP 异常类和依赖注入
@@ -18,6 +19,8 @@ from langchain_core.tools import tool
 from langchain_core.utils.function_calling import convert_to_openai_tool
 from ddgs import DDGS
 from openai import AsyncOpenAI  # 导入原始异步 OpenAI 客户端用于捕获 reasoning_content
+from langgraph.graph import StateGraph, START, END
+
 
 from services.rag import RAGRetriever, validate_safe_id
 from services.db import create_session, add_session_message
@@ -229,6 +232,8 @@ class ChatRequest(BaseModel):  # 定义聊天接口请求体的数据模型
     ragEnabled: bool = False  # 是否启用 RAG 检索增强，默认关闭
     sessionId: Optional[str] = None  # 会话 ID，可为空（表示新建会话）
     kbId: Optional[str] = None  # 选中的知识库 ID
+    agentType: Optional[str] = "1"  # 使用的智能体架构类型，例如 "1" 或 "2"
+
 
 
 # ── Helper Functions ──────────────────────────────────────────────────────
@@ -586,6 +591,256 @@ async def execute_and_log_tools(
     yield "text", "</think>"
 
 
+# ── LangGraph Agent Definition & Workflow ──────────────────────────────────
+
+class AgentState(TypedDict):
+    """状态字典，用于存储对话历史与当前执行轮次。"""
+    messages: list[dict]
+    current_turn: int
+
+
+async def agent_node(state: AgentState, config) -> AgentState:
+    """Agent 节点：调用 LLM 生成回答，支持流式解析推理内容与工具调用参数。"""
+    callback = config.get("configurable", {}).get("callback")
+    model_name = os.getenv("LLM_MODEL", "Xiaomi/mimo-v2.5")
+    is_reasoning_model = "mimo-v2.5" in model_name.lower() or "mimo" in model_name.lower()
+    
+    current_turn = state.get("current_turn", 0) + 1
+    max_turns = 5
+    
+    extra_params = {
+        "temperature": 0.7
+    }
+    
+    # 准备 OpenAI 格式的工具列表
+    tools_list = [get_current_weather, get_exchange_rate, web_search, web_fetch]
+    openai_tools = [convert_to_openai_tool(t) for t in tools_list]
+    
+    # 达到上限时禁用工具调用以避免死循环
+    if current_turn <= max_turns:
+        turn_tools = openai_tools
+    else:
+        turn_tools = None
+        if is_reasoning_model:
+            extra_params["extra_body"] = {
+                "thinking": {
+                    "type": "disabled"
+                }
+            }
+            
+    print(f"[langgraph] Turn {current_turn}: Invoking raw OpenAI API ({model_name})...")
+    
+    response = await raw_openai_client.chat.completions.create(
+        model=model_name,
+        messages=state["messages"],
+        stream=True,
+        tools=turn_tools,
+        **extra_params
+    )
+    
+    processor = StreamBufferProcessor()
+    
+    try:
+        async for chunk in response:
+            for event_type, val in processor.process_chunk(chunk):
+                if callback:
+                    await callback(event_type, val)
+    finally:
+        await response.close()
+        
+    for event_type, val in processor.finalize():
+        if callback:
+            await callback(event_type, val)
+            
+    # 解析任何形式的工具调用
+    all_tool_calls = parse_any_tool_calls(
+        tool_calls_accumulator=processor.tool_calls_accumulator,
+        accumulated_content=processor.accumulated_content,
+        allow_parse=(current_turn <= max_turns)
+    )
+    
+    openai_tool_calls = []
+    for tc in all_tool_calls:
+        openai_tool_calls.append({
+            "id": tc["id"],
+            "type": "function",
+            "function": {
+                "name": tc["name"],
+                "arguments": json.dumps(tc["args"], ensure_ascii=False)
+            }
+        })
+        
+    assistant_msg = {
+        "role": "assistant",
+        "content": processor.accumulated_content
+    }
+    if processor.tool_calls_accumulator:
+        assistant_msg["tool_calls"] = openai_tool_calls
+        assistant_msg["content"] = ""
+        
+    new_messages = list(state["messages"])
+    new_messages.append(assistant_msg)
+    
+    return {
+        "messages": new_messages,
+        "current_turn": current_turn
+    }
+
+
+async def tools_node(state: AgentState, config) -> AgentState:
+    """Action 节点：并行执行所有匹配到的工具，回传日志并保存结果至状态中。"""
+    callback = config.get("configurable", {}).get("callback")
+    
+    last_message = state["messages"][-1]
+    openai_tool_calls = last_message.get("tool_calls", [])
+    
+    # 解析工具参数
+    all_tool_calls = []
+    for tc in openai_tool_calls:
+        func = tc.get("function", {})
+        try:
+            args = json.loads(func.get("arguments", "{}"))
+        except Exception:
+            args = {}
+        all_tool_calls.append({
+            "id": tc.get("id"),
+            "name": func.get("name"),
+            "args": args
+        })
+        
+    tools_map = {
+        "get_current_weather": get_current_weather,
+        "get_exchange_rate": get_exchange_rate,
+        "web_search": web_search,
+        "web_fetch": web_fetch
+    }
+    
+    tasks = []
+    matched_calls = []
+    for tc in all_tool_calls:
+        name = tc["name"]
+        if name in tools_map:
+            tool_func = tools_map[name]
+            tasks.append(tool_func.ainvoke(tc["args"]))
+            matched_calls.append(tc)
+            
+    new_messages = list(state["messages"])
+    
+    if tasks:
+        # 推送使用工具日志
+        start_logs = []
+        for tc in matched_calls:
+            display_name = TOOL_DISPLAY_NAMES.get(tc["name"], tc["name"])
+            start_logs.append(f"* 🔧 **使用工具**: {display_name}")
+            
+        if callback:
+            await callback("text", "<think>\n" + "\n".join(start_logs) + "\n")
+            
+        print(f"[langgraph] Parallel executing tools: {[tc['name'] for tc in matched_calls]}")
+        results = await asyncio.gather(*tasks)
+        
+        for tc, output in zip(matched_calls, results):
+            new_messages.append({
+                "role": "tool",
+                "name": tc["name"],
+                "tool_call_id": tc["id"],
+                "content": str(output)
+            })
+            
+        if callback:
+            await callback("text", "</think>")
+            
+    return {
+        "messages": new_messages,
+        "current_turn": state["current_turn"]
+    }
+
+
+def should_continue(state: AgentState) -> str:
+    """条件路由：根据最后一轮消息是否包含工具调用及轮次限制，决定下一步走向。"""
+    last_message = state["messages"][-1]
+    tool_calls = last_message.get("tool_calls")
+    if not tool_calls:
+        return "end"
+        
+    # 安全验证：至少包含一个后端支持的工具
+    supported_tools = {"get_current_weather", "get_exchange_rate", "web_search", "web_fetch"}
+    has_matched = any(tc.get("function", {}).get("name") in supported_tools for tc in tool_calls)
+    
+    if has_matched and state.get("current_turn", 0) < 5:
+        return "tools"
+    return "end"
+
+
+# 编译 LangGraph 工作流状态图
+workflow = StateGraph(AgentState)
+workflow.add_node("agent", agent_node)
+workflow.add_node("tools", tools_node)
+
+workflow.add_edge(START, "agent")
+workflow.add_conditional_edges(
+    "agent",
+    should_continue,
+    {
+        "tools": "tools",
+        "end": END
+    }
+)
+workflow.add_edge("tools", "agent")
+
+langgraph_agent = workflow.compile()
+
+
+async def generate_langgraph_chat_stream(
+    system_prompt: str,
+    chat_history_messages: list,
+    last_user_content: str
+) -> AsyncGenerator[tuple[str, str], None]:
+    """使用 LangGraph 工作流进行生成，并通过 asyncio.Queue 异步适配流式输出。"""
+    # 格式化为 API 请求所需的消息结构
+    initial_messages = [{"role": "system", "content": system_prompt}]
+    for msg in chat_history_messages:
+        role = "user" if msg.type == "human" else "assistant"
+        initial_messages.append({"role": role, "content": msg.content})
+    initial_messages.append({"role": "user", "content": last_user_content})
+    
+    queue = asyncio.Queue()
+    
+    async def callback(event_type: str, content: str):
+        await queue.put((event_type, content))
+        
+    async def run_graph():
+        try:
+            initial_state = {
+                "messages": initial_messages,
+                "current_turn": 0
+            }
+            # 运行编译后的状态图
+            await langgraph_agent.ainvoke(
+                initial_state,
+                config={"configurable": {"callback": callback}}
+            )
+        except Exception as e:
+            print(f"[langgraph] Execution failed: {e}")
+            await queue.put(("error", f"状态图执行失败: {str(e)}"))
+        finally:
+            await queue.put((None, None))
+            
+    # 在后台异步启动 graph 运行
+    graph_task = asyncio.create_task(run_graph())
+    
+    try:
+        while True:
+            event_type, val = await queue.get()
+            if event_type is None:
+                break
+            yield event_type, val
+        await graph_task
+    finally:
+        if not graph_task.done():
+            graph_task.cancel()
+
+
 async def generate_chat_stream(
     system_prompt: str,
     chat_history_messages: list,
@@ -742,7 +997,7 @@ async def chat(request: ChatRequest, tenant_id: str = Depends(get_current_tenant
     # 2. 会话管理 (Session): create if needed, save user message
     session_id = request.sessionId
     if not session_id:
-        session_id = await asyncio.to_thread(create_session, last_user.content[:30])
+        session_id = await asyncio.to_thread(create_session, last_user.content[:30], "1")
     await asyncio.to_thread(add_session_message, session_id, "user", last_user.content)
 
     # 3. 处理 RAG 预处理与系统 Prompt 生成，得到带知识库的系统提示词
@@ -801,4 +1056,76 @@ async def chat(request: ChatRequest, tenant_id: str = Depends(get_current_tenant
             "Connection": "keep-alive",
             "X-Vercel-AI-Data-Stream": "v1",
         },
+    )
+
+
+@router.post("/api/chat/langgraph")  # 注册 POST /api/chat/langgraph 路由
+async def chat_langgraph(request: ChatRequest, tenant_id: str = Depends(get_current_tenant_id)) -> StreamingResponse:  # LangGraph 聊天接口
+    print(f"[chat_langgraph] tenant_id={tenant_id} ragEnabled={request.ragEnabled} kbId={request.kbId} messages={len(request.messages)}")  # 打印调试日志
+
+    # 1. 查找并验证最后一条用户消息
+    last_user, last_user_idx = extract_last_user_message(request.messages)
+
+    # 2. 会话管理 (Session): create if needed, save user message
+    session_id = request.sessionId
+    if not session_id:
+        session_id = await asyncio.to_thread(create_session, last_user.content[:30], "langgraph")
+    await asyncio.to_thread(add_session_message, session_id, "user", last_user.content)
+
+    # 3. 处理 RAG 预处理与系统 Prompt 生成，得到带知识库的系统提示词
+    system_prompt, sources = await prepare_rag_prompt(
+        messages=request.messages,
+        last_user_idx=last_user_idx,
+        rag_enabled=request.ragEnabled,
+        kb_id=request.kbId,
+        tenant_id=tenant_id
+    )
+
+    # 4. 转换历史对话消息为 LangChain 格式
+    chat_history_messages = to_langchain_messages(request.messages[:last_user_idx])
+
+    # 5. 定义流式生成器
+    async def generate() -> AsyncGenerator[str, None]:
+        if session_id:
+            yield f'2:[{json.dumps({"type": "session", "sessionId": session_id})}]\n'  # 推送会话信息给前端
+
+        full_content = ""  # 用于累积完整的助手回复内容
+
+        try:
+            # 6. 调用 LangGraph 流式生成器，接收并推送流数据
+            async for event_type, value in generate_langgraph_chat_stream(
+                system_prompt=system_prompt,
+                chat_history_messages=chat_history_messages,
+                last_user_content=last_user.content
+            ):
+                if event_type == "text":
+                    yield f"0:{json.dumps(value, ensure_ascii=False)}\n"
+                    full_content += value
+                elif event_type == "error":
+                    yield f"0:{json.dumps(value, ensure_ascii=False)}\n"
+
+            print('[chat_langgraph] 消息入库')
+            if session_id and full_content:
+                await asyncio.to_thread(add_session_message, session_id, "assistant", full_content)  # 将助手回复写入会话
+
+            yield 'd:{"finishReason":"stop"}\n'  # 推送流结束帧
+
+        except asyncio.CancelledError:
+            print(f"[chat_langgraph] Generation cancelled by client (session: {session_id}).")
+            if session_id and full_content:
+                print(f"[chat_langgraph] Saving partial content on cancel: {len(full_content)} chars")
+                asyncio.create_task(asyncio.to_thread(add_session_message, session_id, "assistant", full_content))
+            raise
+        except Exception as e:
+            print(f"[chat_langgraph] Chat chain generation failed: {e}")
+            yield f"0:{json.dumps(f'生成失败: {str(e)}', ensure_ascii=False)}\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/plain",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Vercel-AI-Data-Stream": "v1",
+        }
     )

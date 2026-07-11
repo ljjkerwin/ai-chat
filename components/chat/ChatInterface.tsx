@@ -1,15 +1,20 @@
 'use client'
 
 import { useChat } from 'ai/react'
-import { useEffect, useRef, type FormEvent } from 'react'
-import { Send, Square, Plus, Zap, AlertCircle, Menu } from 'lucide-react'
+import { useEffect, useRef, useState, type FormEvent } from 'react'
+import { Send, Square, Plus, Zap, AlertCircle, Menu, Settings, Database } from 'lucide-react'
+import Link from 'next/link'
+
+
+
 import { useRAG } from '@/contexts/RAGContext'
 import { useSession } from '@/contexts/SessionContext'
+import agents from '@/data/agents.json'
 import MessageItem from './MessageItem'
 import { cn } from '@/lib/utils'
 
 export default function ChatInterface() {
-  const { ragEnabled, kbId } = useRAG()
+  const { ragEnabled, setRagEnabled, kbId, setKbId, agentType, setAgentType, knowledgeBases } = useRAG()
   const {
     currentSessionId,
     setCurrentSessionId,
@@ -24,6 +29,24 @@ export default function ChatInterface() {
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const prevDataLen = useRef(0)
   const urlSyncReady = useRef(false)
+  const prevAgentType = useRef<string | null>(null)
+
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false)
+  const settingsRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    function handleClickOutside(event: MouseEvent) {
+      if (settingsRef.current && !settingsRef.current.contains(event.target as Node)) {
+        setIsSettingsOpen(false)
+      }
+    }
+    document.addEventListener('mousedown', handleClickOutside)
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside)
+    }
+  }, [])
+
+  const apiEndpoint = `${process.env.NEXT_PUBLIC_BACKEND_URL ?? 'http://localhost:8000'}/api/chat${agentType === '2' ? '/langgraph' : ''}`
 
   const {
     messages,
@@ -35,7 +58,7 @@ export default function ChatInterface() {
     error,
     setMessages,
     data,
-  } = useChat({ api: `${process.env.NEXT_PUBLIC_BACKEND_URL ?? 'http://localhost:8000'}/api/chat` })
+  } = useChat({ api: apiEndpoint })
   // Restore session from URL on mount
   useEffect(() => {
     const params = new URLSearchParams(window.location.search)
@@ -51,20 +74,29 @@ export default function ChatInterface() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // Sync currentSessionId → URL query param
+  // Sync currentSessionId and agentType → URL query param
   useEffect(() => {
     if (!urlSyncReady.current) {
       urlSyncReady.current = true
       return
     }
     const url = new URL(window.location.href)
+    const currentAgent = url.searchParams.get('agent')
+
+    if (agentType === '1') {
+      if (currentAgent !== '1' && currentAgent !== 'default' && currentAgent !== 'react') {
+        url.searchParams.delete('agent')
+      }
+    } else {
+      url.searchParams.set('agent', agentType)
+    }
     if (currentSessionId) {
       url.searchParams.set('session', currentSessionId)
     } else {
       url.searchParams.delete('session')
     }
     window.history.replaceState({}, '', url.toString())
-  }, [currentSessionId])
+  }, [currentSessionId, agentType])
 
   // Load messages when switching sessions
   useEffect(() => {
@@ -76,6 +108,35 @@ export default function ChatInterface() {
     prevDataLen.current = 0
     clearPendingMessages()
   }, [pendingMessages, setMessages, clearPendingMessages, stop])
+
+  // Clear chat history when switching agents
+  useEffect(() => {
+    if (prevAgentType.current !== null && prevAgentType.current !== agentType) {
+      stop()
+      setMessages([])
+      prevDataLen.current = 0
+    }
+    prevAgentType.current = agentType
+  }, [agentType, setMessages, stop])
+
+  // Sync URL search params → agentType state
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search)
+    const agentParam = params.get('agent')
+    if (agentParam === '2' || agentParam === 'langgraph') {
+      if (agentType !== '2') {
+        setAgentType('2')
+      }
+    } else if (agentParam === '1' || agentParam === 'default' || agentParam === 'react') {
+      if (agentType !== '1') {
+        setAgentType('1')
+      }
+    } else {
+      if (agentType !== '1') {
+        setAgentType('1')
+      }
+    }
+  }, [agentType, setAgentType])
 
   // Abort active generation on component unmount (e.g. navigating away)
   useEffect(() => {
@@ -127,7 +188,7 @@ export default function ChatInterface() {
   const handleSubmit = (e: FormEvent) => {
     e.preventDefault()
     if (!input.trim() || isLoading) return
-    originalHandleSubmit(e, { body: { ragEnabled, sessionId: currentSessionId, kbId } })
+    originalHandleSubmit(e, { body: { ragEnabled, sessionId: currentSessionId, kbId, agentType } })
   }
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -148,7 +209,7 @@ export default function ChatInterface() {
     <div className="flex flex-col h-full">
       {/* Header */}
       <header className="flex items-center justify-between px-4 md:px-6 py-3.5 bg-white border-b border-gray-200 shrink-0">
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-3">
           <button
             onClick={() => setSidebarOpen(true)}
             className="md:hidden p-1 mr-1 text-gray-500 hover:text-gray-900 hover:bg-gray-100 rounded-lg transition-colors"
@@ -156,13 +217,68 @@ export default function ChatInterface() {
           >
             <Menu className="w-5 h-5" />
           </button>
-          {/* <h1 className="font-semibold text-gray-900">AI 聊天</h1> */}
-          {/* {ragEnabled && (
-            <span className="flex items-center gap-1 text-xs bg-amber-100 text-amber-700 px-2 py-0.5 rounded-full font-medium">
-              <Zap className="w-3 h-3" />
-              RAG 已开启
-            </span>
-          )} */}
+          <h1 className="text-sm font-semibold text-gray-800">
+            {agents.find(a => a.id === agentType)?.name ?? '智能助理'}
+          </h1>
+          <div ref={settingsRef} className="relative flex items-center">
+            <button
+              onClick={() => setIsSettingsOpen(!isSettingsOpen)}
+              className={cn(
+                "p-1.5 text-gray-400 hover:text-gray-600 hover:bg-gray-100 rounded-lg transition-all flex items-center justify-center",
+                isSettingsOpen && "text-blue-600 bg-blue-50"
+              )}
+              title="知识库设置"
+              aria-label="知识库设置"
+            >
+              <Settings className="w-4 h-4" />
+            </button>
+            {isSettingsOpen && (
+              <div className="absolute left-1/2 -translate-x-1/2 md:left-0 md:translate-x-0 mt-2 w-72 bg-white border border-gray-200 rounded-xl shadow-xl p-4 z-50 animate-in fade-in slide-in-from-top-2 duration-200 top-full">
+                <h3 className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-3">关联知识库</h3>
+                <div className="space-y-3.5">
+                  <div className="flex items-center gap-2">
+                    <div className="flex-1 flex items-center gap-1.5 bg-gray-50 hover:bg-gray-100 border border-gray-200 rounded-lg px-2.5 py-1.5 transition-all min-w-0">
+                      <Database className={cn("w-3.5 h-3.5 shrink-0 transition-colors", ragEnabled ? "text-amber-500" : "text-gray-400")} />
+                      <select
+                        value={ragEnabled ? (kbId || '1') : 'none'}
+                        onChange={e => {
+                          const val = e.target.value
+                          if (val === 'none') {
+                            setRagEnabled(false)
+                            setKbId(null)
+                          } else {
+                            setRagEnabled(true)
+                            setKbId(val)
+                          }
+                        }}
+                        className="bg-transparent text-xs text-gray-700 font-semibold focus:outline-none cursor-pointer w-full truncate"
+                        aria-label="选择关联知识库"
+                      >
+                        <option value="none">无 (禁用 RAG)</option>
+                        {knowledgeBases.map(kb => (
+                          <option key={kb.id} value={kb.id}>
+                            {kb.name}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+                  <div className="pt-2 border-t border-gray-100 flex items-center justify-between text-xs text-gray-400">
+                    <span>
+                      {ragEnabled ? "已启用 RAG 检索" : "RAG 已禁用"}
+                    </span>
+                    <Link
+                      href="/knowledge"
+                      onClick={() => setIsSettingsOpen(false)}
+                      className="text-blue-600 hover:text-blue-700 transition-colors font-medium flex items-center gap-1"
+                    >
+                      管理知识库
+                    </Link>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
         </div>
 
         <button
@@ -177,7 +293,7 @@ export default function ChatInterface() {
       {/* Messages */}
       <div className="flex-1 overflow-y-auto py-4">
         {messages.length === 0 ? (
-          <EmptyState ragEnabled={ragEnabled} />
+          null
         ) : (
           messages.map((msg, idx) => {
             const isLastAssistant =
@@ -233,7 +349,7 @@ export default function ChatInterface() {
               value={input}
               onChange={handleInputChange}
               onKeyDown={handleKeyDown}
-              placeholder={ragEnabled ? '输入问题（将参考知识库）…' : '输入消息…'}
+              placeholder={'输入消息…'}
               rows={1}
               className={cn(
                 'w-full resize-none rounded-xl border border-gray-200 bg-gray-50 px-4 py-3 pr-12 no-scrollbar',
@@ -283,9 +399,6 @@ function EmptyState({ ragEnabled }: { ragEnabled: boolean }) {
   return (
     <div className="flex flex-col items-center justify-center h-full gap-6 px-4 text-center">
       <div>
-        <div className="w-16 h-16 bg-blue-50 rounded-2xl flex items-center justify-center mx-auto mb-3">
-          <Zap className={cn('w-8 h-8', ragEnabled ? 'text-amber-500' : 'text-blue-400')} />
-        </div>
         {/* <h2 className="text-lg font-semibold text-gray-800 mb-1">
           {ragEnabled ? 'RAG 增强模式' : '开始对话'}
         </h2> */}

@@ -1,7 +1,8 @@
 'use client'
 
-import { createContext, useContext, useState, useCallback, type ReactNode } from 'react'
+import { createContext, useContext, useState, useCallback, useEffect, useRef, type ReactNode } from 'react'
 import type { Session, SessionMessage } from '@/types'
+import { useRAG } from './RAGContext'
 
 interface SessionContextValue {
   currentSessionId: string | null
@@ -16,6 +17,7 @@ interface SessionContextValue {
   hasMore: boolean
   loadingMore: boolean
   loadMoreSessions: () => Promise<void>
+  initialLoading: boolean
 }
 
 const SessionContext = createContext<SessionContextValue>({
@@ -31,9 +33,11 @@ const SessionContext = createContext<SessionContextValue>({
   hasMore: false,
   loadingMore: false,
   loadMoreSessions: async () => { },
+  initialLoading: true,
 })
 
 export function SessionProvider({ children }: { children: ReactNode }) {
+  const { agentType } = useRAG()
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(null)
   const [sessions, setSessions] = useState<Session[]>([])
   const [pendingMessages, setPendingMessages] = useState<SessionMessage[] | null>(null)
@@ -41,25 +45,37 @@ export function SessionProvider({ children }: { children: ReactNode }) {
   const [page, setPage] = useState(1)
   const [hasMore, setHasMore] = useState(true)
   const [loadingMore, setLoadingMore] = useState(false)
+  const [initialLoading, setInitialLoading] = useState(true)
+
+  const lastFetchId = useRef(0)
 
   const reloadSessions = useCallback(() => {
+    const fetchId = ++lastFetchId.current
     setPage(1)
     setHasMore(true)
-    fetch('/api/sessions?page=1&page_size=30')
+    setInitialLoading(true)
+    fetch(`/api/sessions?page=1&page_size=30&agent_type=${agentType}`)
       .then(r => r.json())
       .then(d => {
-        setSessions(d.sessions ?? [])
-        setHasMore(d.has_more ?? false)
+        if (fetchId === lastFetchId.current) {
+          setSessions(d.sessions ?? [])
+          setHasMore(d.has_more ?? false)
+        }
       })
       .catch(() => { })
-  }, [])
+      .finally(() => {
+        if (fetchId === lastFetchId.current) {
+          setInitialLoading(false)
+        }
+      })
+  }, [agentType])
 
   const loadMoreSessions = useCallback(async () => {
     if (loadingMore || !hasMore) return
     setLoadingMore(true)
     try {
       const nextPage = page + 1
-      const res = await fetch(`/api/sessions?page=${nextPage}&page_size=30`)
+      const res = await fetch(`/api/sessions?page=${nextPage}&page_size=30&agent_type=${agentType}`)
       const d = await res.json()
       setSessions(prev => {
         const existingIds = new Set(prev.map(s => s.id))
@@ -73,7 +89,12 @@ export function SessionProvider({ children }: { children: ReactNode }) {
     } finally {
       setLoadingMore(false)
     }
-  }, [page, hasMore, loadingMore])
+  }, [page, hasMore, loadingMore, agentType])
+
+  useEffect(() => {
+    reloadSessions()
+    setCurrentSessionId(null)
+  }, [agentType, reloadSessions])
 
   const switchSession = useCallback(async (id: string | null) => {
     setCurrentSessionId(id)
@@ -103,6 +124,7 @@ export function SessionProvider({ children }: { children: ReactNode }) {
       hasMore,
       loadingMore,
       loadMoreSessions,
+      initialLoading,
     }}>
       {children}
     </SessionContext.Provider>

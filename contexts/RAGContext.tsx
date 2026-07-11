@@ -8,6 +8,8 @@ interface RAGContextValue {
   setRagEnabled: (v: boolean) => void
   kbId: string | null
   setKbId: (v: string | null) => void
+  agentType: '1' | '2'
+  setAgentType: (v: '1' | '2') => void
   knowledgeBases: KnowledgeBase[]
   refreshKBs: () => Promise<void>
 }
@@ -17,6 +19,8 @@ const RAGContext = createContext<RAGContextValue>({
   setRagEnabled: () => {},
   kbId: null,
   setKbId: () => {},
+  agentType: '1',
+  setAgentType: () => {},
   knowledgeBases: [],
   refreshKBs: async () => {},
 })
@@ -24,11 +28,24 @@ const RAGContext = createContext<RAGContextValue>({
 export function RAGProvider({ children }: { children: ReactNode }) {
   const [ragEnabled, setRagEnabledState] = useState(false)
   const [kbId, setKbIdState] = useState<string | null>(null)
+  const [agentType, setAgentTypeState] = useState<'1' | '2'>('1')
   const [knowledgeBases, setKnowledgeBases] = useState<KnowledgeBase[]>([])
 
   useEffect(() => {
     setRagEnabledState(localStorage.getItem('ragEnabled') === 'true')
     setKbIdState(localStorage.getItem('kbId') || '1')
+    const params = new URLSearchParams(window.location.search)
+    const agentParam = params.get('agent')
+    if (agentParam && (agentParam === 'react' || agentParam === 'langgraph' || agentParam === 'default' || agentParam === '1' || agentParam === '2')) {
+      const mappedAgent = (agentParam === 'react' || agentParam === 'default') ? '1' : (agentParam === 'langgraph' ? '2' : agentParam)
+      setAgentTypeState(mappedAgent as '1' | '2')
+      localStorage.setItem('agentType', mappedAgent)
+    } else {
+      const cached = localStorage.getItem('agentType')
+      const defaultAgent = (cached === 'react' || cached === 'default') ? '1' : (cached === 'langgraph' ? '2' : ((cached as '1' | '2') || '1'))
+      setAgentTypeState(defaultAgent)
+      localStorage.setItem('agentType', defaultAgent)
+    }
   }, [])
 
   const setRagEnabled = (v: boolean) => {
@@ -45,10 +62,17 @@ export function RAGProvider({ children }: { children: ReactNode }) {
     }
   }
 
+  const setAgentType = (v: '1' | '2') => {
+    setAgentTypeState(v)
+    localStorage.setItem('agentType', v)
+  }
+
   const refreshKBs = useCallback(async () => {
+    console.log("DEBUG: refreshKBs starting...")
     try {
       const res = await fetch('/api/knowledge-bases')
       const data = await res.json()
+      console.log("DEBUG: refreshKBs succeeded, data:", data)
       setKnowledgeBases(data.knowledgeBases ?? [])
     } catch (e) {
       console.error('[RAGContext] Failed to load knowledge bases:', e)
@@ -56,6 +80,7 @@ export function RAGProvider({ children }: { children: ReactNode }) {
   }, [])
 
   useEffect(() => {
+    console.log("DEBUG: RAGProvider useEffect for refreshKBs running")
     refreshKBs()
   }, [refreshKBs])
 
@@ -65,6 +90,8 @@ export function RAGProvider({ children }: { children: ReactNode }) {
       setRagEnabled,
       kbId,
       setKbId,
+      agentType,
+      setAgentType,
       knowledgeBases,
       refreshKBs
     }}>

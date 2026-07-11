@@ -183,7 +183,21 @@ def init_db() -> None:
                     MODIFY term VARCHAR(128) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL
                 """)
             except Exception as ex:
-                print(f"[DB] Migration warning/failed for term_df collation: {ex}")
+                pass
+
+            # Safe migration: ensure sessions table has agent_type column
+            try:
+                cursor.execute("ALTER TABLE sessions ADD COLUMN agent_type VARCHAR(50) DEFAULT '1';")
+                print("[DB] Successfully migrated sessions table to support agent_type column.")
+            except Exception as ex:
+                pass
+
+            try:
+                cursor.execute("UPDATE sessions SET agent_type = '1' WHERE agent_type = 'react' OR agent_type = 'default';")
+                cursor.execute("UPDATE sessions SET agent_type = '2' WHERE agent_type = 'langgraph';")
+                print("[DB] Successfully updated agent_type to '1' and '2' for existing sessions.")
+            except Exception as ex:
+                pass
 
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS rag_metadata (
@@ -313,38 +327,39 @@ def delete_document_by_id(doc_id: str, tenant_id: str) -> None:
 # ── Sessions ──────────────────────────────────────────────────────────────
 
 
-def create_session(title: str) -> str:
+def create_session(title: str, agent_type: str = "1") -> str:
     session_id = str(uuid4())
     now = int(time.time() * 1000)
     with get_conn() as conn:
         with conn.cursor() as cursor:
             cursor.execute(
-                "INSERT INTO sessions (id, title, created_at, updated_at) VALUES (%s, %s, %s, %s)",
-                (session_id, title[:50], now, now),
+                "INSERT INTO sessions (id, title, agent_type, created_at, updated_at) VALUES (%s, %s, %s, %s, %s)",
+                (session_id, title[:50], agent_type, now, now),
             )
     return session_id
 
 
-def get_sessions(limit: int = 30, offset: int = 0) -> list[dict]:
+def get_sessions(limit: int = 30, offset: int = 0, agent_type: str = "1") -> list[dict]:
     with get_conn() as conn:
         with conn.cursor() as cursor:
             cursor.execute("""
-                SELECT s.id, s.title, s.created_at, s.updated_at,
+                SELECT s.id, s.title, s.created_at, s.updated_at, s.agent_type,
                        COUNT(m.id) AS message_count
-                FROM sessions s
-                LEFT JOIN session_messages m ON m.session_id = s.id
-                GROUP BY s.id, s.title, s.created_at, s.updated_at
-                ORDER BY s.updated_at DESC
-                LIMIT %s OFFSET %s
-            """, (limit, offset))
+                 FROM sessions s
+                 LEFT JOIN session_messages m ON m.session_id = s.id
+                 WHERE s.agent_type = %s
+                 GROUP BY s.id, s.title, s.created_at, s.updated_at, s.agent_type
+                 ORDER BY s.updated_at DESC
+                 LIMIT %s OFFSET %s
+            """, (agent_type, limit, offset))
             rows = cursor.fetchall()
     return [dict(r) for r in rows]
 
 
-def get_sessions_count() -> int:
+def get_sessions_count(agent_type: str = "1") -> int:
     with get_conn() as conn:
         with conn.cursor() as cursor:
-            cursor.execute("SELECT COUNT(*) as count FROM sessions")
+            cursor.execute("SELECT COUNT(*) as count FROM sessions WHERE agent_type = %s", (agent_type,))
             row = cursor.fetchone()
             return row["count"] if row else 0
 
