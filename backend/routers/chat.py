@@ -400,6 +400,192 @@ async def execute_tools(tool_calls: list[dict]) -> list[ToolMessage]:
     return tool_messages
 
 
+
+class StreamBufferProcessor:
+    """处理并拦截大模型输出流，区分思维链、普通正文和工具调用，
+    缓存疑似 XML 格式的工具调用标签以防泄露给用户。
+    """
+    def __init__(self):
+        # 标识当前是否正处于模型的思维链/深度思考输出状态
+        self.in_thinking = False
+        # 累加与拼接标准 OpenAI 格式工具调用的字典，键为 tool_call 的 index，值为字典：{"id", "name", "arguments"}
+        self.tool_calls_accumulator = {}
+        # 累积记录模型本轮返回的完整正文内容，后续用于解析可能存在的 XML 格式工具调用
+        self.accumulated_content = ""
+        # 临时文本缓冲区，用来拦截并延迟流式输出可能是 XML 标签的文本前缀（如 "<tool_call"）
+        self.text_buffer = ""
+        # 标识本轮是否检测到了工具调用（包括标准工具调用与 XML 格式工具调用前缀），用于控制正文输出
+        self.tool_call_detected = False
+
+    def process_chunk(self, chunk) -> list[tuple[str, str]]:
+        """处理单个流数据包 (Chunk)，返回要向客户端 yield 的事件列表 (event_type, value)"""
+        events = []
+        delta = chunk.choices[0].delta if chunk.choices else None
+        if not delta:
+            return events
+
+        # 1. 收集并拼接标准的 OpenAI tool_calls 信息
+        tool_calls = getattr(delta, "tool_calls", None)
+        if tool_calls:
+            self.tool_call_detected = True
+            for tc in tool_calls:
+                idx = tc.index
+                if idx not in self.tool_calls_accumulator:
+                    self.tool_calls_accumulator[idx] = {
+                        "id": tc.id,
+                        "name": tc.function.name if tc.function else "",
+                        "arguments": ""
+                    }
+                else:
+                    if tc.id:
+                        self.tool_calls_accumulator[idx]["id"] = tc.id
+                    if tc.function and tc.function.name:
+                        self.tool_calls_accumulator[idx]["name"] = tc.function.name
+                
+                if tc.function and tc.function.arguments:
+                    self.tool_calls_accumulator[idx]["arguments"] += tc.function.arguments
+
+        # 2. 处理原生推理流字段 reasoning_content（例如 DeepSeek r1 的思维链内容）
+        reasoning = getattr(delta, "reasoning_content", None)
+        if reasoning is None and hasattr(delta, "model_extra") and delta.model_extra:
+            reasoning = delta.model_extra.get("reasoning_content")
+
+        if reasoning:
+            # 如果还未发送过开始思考的标签，则先流式输出 <think> 标识
+            if not self.in_thinking:
+                self.in_thinking = True
+                events.append(("text", "<think>"))
+            events.append(("text", reasoning))
+
+        # 3. 处理最终回复文本 (缓存处理以应对大模型返回的 XML 格式 tool call，避免其泄露给用户)
+        content = getattr(delta, "content", None)
+        if content:
+            # 如果之前在思考，现在切换到正文，先输出闭合标签 </think>
+            if self.in_thinking:
+                self.in_thinking = False
+                events.append(("text", "</think>"))
+
+            self.accumulated_content += content
+            self.text_buffer += content
+
+            # 如果尚未检测到标准的 tool_call，需提防本段文本是否是模型在吐 XML 标签格式的自定义工具调用
+            if not self.tool_call_detected:
+                stripped_buffer = self.text_buffer.strip()
+                # 如果缓存文本可能以 XML 标签开头（可能属于 XML 格式的工具调用前缀）
+                if stripped_buffer.startswith('<'):
+                    possible_prefixes = ["<tool_call", "<function", "<thinking"]
+                    is_prefix = any(p.startswith(stripped_buffer) or stripped_buffer.startswith(p) for p in possible_prefixes)
+                    # 如果不是合法的 XML 工具调用前缀，或者缓存内容过长（>200字符），判定非工具调用，刷新缓存并向前端流式输出
+                    if not is_prefix or len(self.text_buffer) > 200:
+                        events.append(("text", self.text_buffer))
+                        self.text_buffer = ""
+                else:
+                    # 正常文本内容，直接流式发送给前端
+                    events.append(("text", self.text_buffer))
+                    self.text_buffer = ""
+        print(f"events: {events}")
+        return events
+
+    def finalize(self) -> list[tuple[str, str]]:
+        """在流处理结束时，补充闭合标签或残留的正文"""
+        events = []
+        if self.in_thinking:
+            events.append(("text", "</think>"))
+            self.in_thinking = False
+
+        if self.text_buffer and not self.tool_call_detected:
+            # 检查残留的缓冲区里是否包含 XML 工具调用的特定节点
+            if "<tool_call>" in self.text_buffer or "<function=" in self.text_buffer:
+                self.tool_call_detected = True
+            else:
+                events.append(("text", self.text_buffer))
+                self.text_buffer = ""
+        return events
+
+
+def parse_any_tool_calls(
+    tool_calls_accumulator: dict,
+    accumulated_content: str,
+    allow_parse: bool
+) -> list[dict]:
+    """解析并合并所有的工具调用（标准 OpenAI 格式 + 兼容性 XML 格式）
+    如果 allow_parse 为 False，则不解析并返回空列表。
+    """
+    if not allow_parse:
+        return []
+
+    all_tool_calls = []
+
+    # 1. 提取与组装标准 OpenAI 格式的工具调用
+    if tool_calls_accumulator:
+        for idx, tc in sorted(tool_calls_accumulator.items()):
+            try:
+                args = json.loads(tc["arguments"]) if tc["arguments"] else {}
+            except Exception:
+                args = {}
+            all_tool_calls.append({
+                "id": tc["id"],
+                "name": tc["name"],
+                "args": args,
+                "is_xml": False
+            })
+
+    # 2. 如果没有标准工具调用，尝试解析 XML 格式的工具调用（支持某些模型自定义输出的 XML 片段）
+    if not all_tool_calls and ("<tool_call>" in accumulated_content or "<function=" in accumulated_content):
+        xml_calls = parse_xml_tool_calls(accumulated_content)
+        for xc in xml_calls:
+            all_tool_calls.append({
+                "id": xc["id"],
+                "name": xc["name"],
+                "args": xc["args"],
+                "is_xml": True
+            })
+
+    return all_tool_calls
+
+
+async def execute_and_log_tools(
+    all_tool_calls: list[dict],
+    tools_map: dict,
+    api_messages: list
+) -> AsyncGenerator[tuple[str, str], None]:
+    """并行执行后端工具，向客户端 yield 工具执行的开始与结束 <think> 日志，并将结果保存至 api_messages"""
+    tasks = []
+    matched_calls = []
+    for tc in all_tool_calls:
+        name = tc["name"]
+        if name in tools_map:
+            tool_func = tools_map[name]
+            tasks.append(tool_func.ainvoke(tc["args"]))
+            matched_calls.append(tc)
+
+    if not tasks:
+        return
+
+    # 1. 组装并发送工具调用日志（仅展示工具友好名称，不暴露函数名、参数与结果细节）
+    start_logs = []
+    for tc in matched_calls:
+        display_name = TOOL_DISPLAY_NAMES.get(tc["name"], tc["name"])
+        start_logs.append(f"* 🔧 **使用工具**: {display_name}")
+    
+    yield "text", "<think>\n" + "\n".join(start_logs) + "\n"
+
+    print(f"[chat] Executing tools: {[tc['name'] for tc in matched_calls]}")
+    results = await asyncio.gather(*tasks)
+
+    # 2. 将完整结果存入上下文供 LLM 会话使用，不暴露结果细节给用户
+    for tc, output in zip(matched_calls, results):
+        api_messages.append({
+            "role": "tool",
+            "name": tc["name"],
+            "tool_call_id": tc["id"],
+            "content": str(output)
+        })
+    
+    # 3. 闭合思考标签
+    yield "text", "</think>"
+
+
 async def generate_chat_stream(
     system_prompt: str,
     chat_history_messages: list,
@@ -425,16 +611,8 @@ async def generate_chat_stream(
     extra_params = {
         "temperature": 0.7
     }
-    
-    # 先保留深度思考
-    # if is_reasoning_model:
-    #     extra_params["extra_body"] = {
-    #         "thinking": {
-    #             "type": "disabled"
-    #         }
-    #     }
 
-    # 准备 OpenAI 格式的工具列表
+    # 准备 OpenAI 格式的工具列表与映射字典
     tools_list = [get_current_weather, get_exchange_rate, web_search, web_fetch]
     openai_tools = [convert_to_openai_tool(t) for t in tools_list]
 
@@ -449,7 +627,7 @@ async def generate_chat_stream(
         current_turn = 0
         max_turns = 5
 
-        # ── Step 3: 进入 ReAct 循环（允许最多进行 max_turns 轮工具交互，外加一轮强制无工具调用生成） ───
+        # ── Step 3: 进入 ReAct 循环 ───
         while current_turn <= max_turns:
             current_turn += 1
             print(f"[chat] Turn {current_turn}: Invoking raw OpenAI API ({model_name})...")
@@ -467,9 +645,7 @@ async def generate_chat_stream(
                         }
                     }
             
-            # # 查看本轮所有消息
             print('before invoke chat')
-            # print("\n\n".join(str(i) for i in api_messages))
             
             # ── Step 4: 异步请求大模型的流式 chat completions 接口 ─────────
             response = await raw_openai_client.chat.completions.create(
@@ -480,138 +656,33 @@ async def generate_chat_stream(
                 **turn_params
             )
 
-            # 标识当前是否正处于模型的思维链/深度思考输出状态
-            in_thinking = False
-            # 累加与拼接标准 OpenAI 格式工具调用的字典，键为 tool_call 的 index，值为字典：{"id", "name", "arguments"}
-            tool_calls_accumulator = {}
-            # 累积记录模型本轮返回的完整正文内容，后续用于解析可能存在的 XML 格式工具调用
-            accumulated_content = ""
-            # 临时文本缓冲区，用来拦截并延迟流式输出可能是 XML 标签的文本前缀（如 "<tool_call"）
-            text_buffer = ""
-            # 标识本轮是否检测到了工具调用（包括标准工具调用与 XML 格式工具调用前缀），用于控制正文输出
-            tool_call_detected = False
+            # 流式缓冲处理器，负责思维链、XML过滤及标准/自定义工具判定
+            processor = StreamBufferProcessor()
 
             try:
-                # ── Step 5: 流式处理响应数据包 (Chunk)，区分并处理思维链、正文与工具调用 ────────
+                # ── Step 5: 流式处理响应数据包 (Chunk) ────────
                 async for chunk in response:
-                    delta = chunk.choices[0].delta if chunk.choices else None
-                    if not delta:
-                        continue
-
-                    # 1. 收集并拼接标准的 OpenAI tool_calls 信息
-                    tool_calls = getattr(delta, "tool_calls", None)
-                    if tool_calls:
-                        tool_call_detected = True
-                        for tc in tool_calls:
-                            idx = tc.index
-                            if idx not in tool_calls_accumulator:
-                                tool_calls_accumulator[idx] = {
-                                    "id": tc.id,
-                                    "name": tc.function.name if tc.function else "",
-                                    "arguments": ""
-                                }
-                            else:
-                                if tc.id:
-                                    tool_calls_accumulator[idx]["id"] = tc.id
-                                if tc.function and tc.function.name:
-                                    tool_calls_accumulator[idx]["name"] = tc.function.name
-                            
-                            if tc.function and tc.function.arguments:
-                                tool_calls_accumulator[idx]["arguments"] += tc.function.arguments
-
-                    # 2. 处理原生推理流字段 reasoning_content（例如 DeepSeek r1 的思维链内容）
-                    reasoning = getattr(delta, "reasoning_content", None)
-                    if reasoning is None and hasattr(delta, "model_extra") and delta.model_extra:
-                        reasoning = delta.model_extra.get("reasoning_content")
-
-                    if reasoning:
-                        # 如果还未发送过开始思考的标签，则先流式输出 <think> 标识
-                        if not in_thinking:
-                            in_thinking = True
-                            yield "text", "<think>"
-                        yield "text", reasoning
-
-                    # 3. 处理最终回复文本 (缓存处理以应对大模型返回的 XML 格式 tool call，避免其泄露给用户)
-                    content = getattr(delta, "content", None)
-
-                    # print(f"c: {content}")
-                    if content:
-                        # 如果之前在思考，现在切换到正文，先输出闭合标签 </think>
-                        if in_thinking:
-                            in_thinking = False
-                            yield "text", "</think>"
-
-                        accumulated_content += content
-                        text_buffer += content
-
-                        # 如果尚未检测到标准的 tool_call，需提防本段文本是否是模型在吐 XML 标签格式的自定义工具调用
-                        if not tool_call_detected:
-                            stripped_buffer = text_buffer.strip()
-                            # 如果缓存文本可能以 XML 标签开头（可能属于 XML 格式的工具调用前缀）
-                            if stripped_buffer.startswith('<'):
-                                possible_prefixes = ["<tool_call", "<function", "<thinking"]
-                                is_prefix = any(p.startswith(stripped_buffer) or stripped_buffer.startswith(p) for p in possible_prefixes)
-                                # 如果不是合法的 XML 工具调用前缀，或者缓存内容过长（>200字符），判定非工具调用，刷新缓存并向前端流式输出
-                                if not is_prefix or len(text_buffer) > 200:
-                                    yield "text", text_buffer
-                                    text_buffer = ""
-                            else:
-                                # 正常文本内容，直接流式发送给前端
-                                yield "text", text_buffer
-                                text_buffer = ""
+                    for event_type, val in processor.process_chunk(chunk):
+                        yield event_type, val
             finally:
                 await response.close()
 
-            # 流式结束时，如果还在思考模式中，补充闭合标签
-            if in_thinking:
-                yield "text", "</think>"
+            # ── Step 6: 结束当前轮次流处理的收尾工作 ───────
+            for event_type, val in processor.finalize():
+                yield event_type, val
 
-            # 处理可能残留的文本内容
-            if text_buffer and not tool_call_detected:
-                # 检查残留的缓冲区里是否包含 XML 工具调用的特定节点
-                if "<tool_call>" in text_buffer or "<function=" in text_buffer:
-                    tool_call_detected = True
-                else:
-                    yield "text", text_buffer
-                    text_buffer = ""
+            # ── Step 7: 解析与合并所有的工具调用 ─────
+            all_tool_calls = parse_any_tool_calls(
+                tool_calls_accumulator=processor.tool_calls_accumulator,
+                accumulated_content=processor.accumulated_content,
+                allow_parse=(current_turn <= max_turns)
+            )
 
-            # ── Step 6: 解析与合并所有的工具调用 (标准 OpenAI 格式 + 兼容性 XML 格式) ─────
-            all_tool_calls = []
-            print(f"all_tool_calls length: {len(all_tool_calls)}")
-
-            # 仅在 current_turn <= max_turns 时解析工具调用，确保最后一轮强制不调用任何工具
-            if current_turn <= max_turns:
-                # 4.1 提取与组装标准 OpenAI 格式的工具调用
-                if tool_calls_accumulator:
-                    for idx, tc in sorted(tool_calls_accumulator.items()):
-                        try:
-                            args = json.loads(tc["arguments"]) if tc["arguments"] else {}
-                        except Exception:
-                            args = {}
-                        all_tool_calls.append({
-                            "id": tc["id"],
-                            "name": tc["name"],
-                            "args": args,
-                            "is_xml": False
-                        })
-
-                # 4.2 如果没有标准工具调用，尝试解析 XML 格式的工具调用（支持某些模型自定义输出的 XML 片段）
-                if not all_tool_calls and ("<tool_call>" in accumulated_content or "<function=" in accumulated_content):
-                    tool_call_detected = True
-                    xml_calls = parse_xml_tool_calls(accumulated_content)
-                    for xc in xml_calls:
-                        all_tool_calls.append({
-                            "id": xc["id"],
-                            "name": xc["name"],
-                            "args": xc["args"],
-                            "is_xml": True
-                        })
-
-            # ── Step 7: 如果本次大模型输出没有触发任何工具调用，说明已经生成了最终答案，退出 ReAct 循环 ─
+            # ── Step 8: 如果本次大模型输出没有触发任何工具调用，说明已经生成了最终答案，退出 ReAct 循环 ─
             if not all_tool_calls:
                 break
 
-            # ── Step 8: 格式化 assistant 的 tool_calls 并将其追加到当前上下文消息中 ───────
+            # ── Step 9: 格式化 assistant 的 tool_calls 并将其追加到当前上下文消息中 ───────
             openai_tool_calls = []
             for tc in all_tool_calls:
                 openai_tool_calls.append({
@@ -625,64 +696,31 @@ async def generate_chat_stream(
 
             assistant_msg = {
                 "role": "assistant",
-                "content": accumulated_content
+                "content": processor.accumulated_content
             }
-            if tool_calls_accumulator:
-                # 标准 OpenAI tool calls 必须在消息体里带上 tool_calls 结构
+            if processor.tool_calls_accumulator:
+                # 标准 OpenAI tool calls 必须在消息体里带上 tool_calls 结构，且 content 设为空
                 assistant_msg["tool_calls"] = openai_tool_calls
-                # 且标准调用下，assistant content 最好为空或前置思考内容（移除 XML 字段）
                 assistant_msg["content"] = ""
 
             # 将 assistant 响应（包含 tool_calls）追加到当前上下文消息中
             api_messages.append(assistant_msg)
 
-            # ── Step 9: 并行执行匹配到的后端工具，并将执行结果存入上下文以备下一轮迭代 ────────
-            tasks = []
-            matched_calls = []
-            for tc in all_tool_calls:
-                name = tc["name"]
-                if name in tools_map:
-                    tool_func = tools_map[name]
-                    tasks.append(tool_func.ainvoke(tc["args"]))
-                    matched_calls.append(tc)
+            # ── Step 10: 并行执行匹配到的后端工具，向前端推送日志并保存结果 ────────
+            has_executed_tools = False
+            async for event_type, val in execute_and_log_tools(all_tool_calls, tools_map, api_messages):
+                has_executed_tools = True
+                yield event_type, val
 
-            # 并行执行匹配到的后端工具
-            if tasks:
-                # 1. 组装并发送工具调用日志（仅展示工具友好名称，不暴露函数名、参数与结果细节）
-                start_logs = []
-                for tc in matched_calls:
-                    display_name = TOOL_DISPLAY_NAMES.get(tc["name"], tc["name"])
-                    start_logs.append(f"* 🔧 **使用工具**: {display_name}")
-                
-                yield "text", "<think>\n" + "\n".join(start_logs) + "\n"
-
-                print(f"[chat] Executing tools: {[tc['name'] for tc in matched_calls]}")
-                results = await asyncio.gather(*tasks)
-
-                # 2. 将完整结果存入上下文供 LLM 会话使用，不暴露结果细节给用户
-                for tc, output in zip(matched_calls, results):
-                    api_messages.append({
-                        "role": "tool",
-                        "name": tc["name"],
-                        "tool_call_id": tc["id"],
-                        "content": str(output)
-                    })
-                
-                # 3. 闭合思考标签
-                yield "text", "</think>"
-
-                # 查看本轮所有消息
-                print("\n\n".join(str(i) for i in api_messages))
-
-            else:
+            if not has_executed_tools:
                 # 如果有工具调用但没有匹配到任何后端工具，为了避免死循环，直接返回内容并退出
                 print(f"[chat] Warning: No matched tool functions for calls: {[tc['name'] for tc in all_tool_calls]}")
-                if accumulated_content:
-                    yield "text", accumulated_content
-
-                # 查看本轮所有消息
-                # print("\n\n".join(str(i) for i in api_messages))
+                if processor.accumulated_content:
+                    yield "text", processor.accumulated_content
                 break
+
+            # 查看本轮所有消息
+            print("\n\n".join(str(i) for i in api_messages))
 
     except Exception as e:
         print(f"[chat] Raw API generation failed: {e}")
