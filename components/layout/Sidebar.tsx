@@ -70,9 +70,6 @@ export default function Sidebar() {
             if (agent.id !== '1') {
               params.set('agent', agent.id)
             }
-            if (currentSessionId && agentType === agent.id) {
-              params.set('session', currentSessionId)
-            }
             const queryStr = params.toString()
             if (queryStr) {
               linkHref += `?${queryStr}`
@@ -82,7 +79,10 @@ export default function Sidebar() {
               <Link
                 key={agent.id}
                 href={linkHref}
-                onClick={() => setAgentType(agent.id as '1' | '2')}
+                onClick={() => {
+                  setAgentType(agent.id as '1' | '2')
+                  switchSession(null)
+                }}
                 className={cn(
                   'group flex items-start gap-2.5 px-3 py-2.5 rounded-xl transition-all border border-transparent',
                   isActive
@@ -140,7 +140,7 @@ export default function Sidebar() {
                         'group flex items-center gap-2 px-3 py-2 rounded-lg cursor-pointer transition-colors text-sm font-medium',
                         currentSessionId === session.id
                           ? 'text-blue-700 font-semibold'
-                          : 'text-gray-600 hover:bg-gray-100 hover:text-gray-900'
+                          : 'text-gray-600 hover:text-gray-900'
                       )}
                     >
                       <span className="flex-1 truncate">{session.title}</span>

@@ -488,7 +488,7 @@ class StreamBufferProcessor:
                     # 正常文本内容，直接流式发送给前端
                     events.append(("text", self.text_buffer))
                     self.text_buffer = ""
-        print(f"events: {events}")
+        # print(f"events: {events}")
         return events
 
     def finalize(self) -> list[tuple[str, str]]:
@@ -1069,7 +1069,7 @@ async def chat_langgraph(request: ChatRequest, tenant_id: str = Depends(get_curr
     # 2. 会话管理 (Session): create if needed, save user message
     session_id = request.sessionId
     if not session_id:
-        session_id = await asyncio.to_thread(create_session, last_user.content[:30], "langgraph")
+        session_id = await asyncio.to_thread(create_session, last_user.content[:30], "2")
     await asyncio.to_thread(add_session_message, session_id, "user", last_user.content)
 
     # 3. 处理 RAG 预处理与系统 Prompt 生成，得到带知识库的系统提示词

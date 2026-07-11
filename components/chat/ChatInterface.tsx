@@ -2,7 +2,7 @@
 
 import { useChat } from 'ai/react'
 import { useEffect, useRef, useState, type FormEvent } from 'react'
-import { Send, Square, Plus, Zap, AlertCircle, Menu, Settings, Database } from 'lucide-react'
+import { Send, Square, Plus, Zap, AlertCircle, Menu, Settings, Database, Bot } from 'lucide-react'
 import Link from 'next/link'
 
 
@@ -314,7 +314,7 @@ export default function ChatInterface() {
         {isLoading && messages[messages.length - 1]?.role !== 'assistant' && (
           <div className="flex gap-3 px-4 py-3">
             <div className="w-8 h-8 rounded-full bg-gray-100 border border-gray-200 flex items-center justify-center shrink-0">
-              <div className="w-3 h-3 border-2 border-gray-400 border-t-transparent rounded-full animate-spin" />
+              <Bot className="w-4 h-4 text-gray-600" />
             </div>
             <div className="bg-white border border-gray-200 rounded-2xl rounded-tl-sm shadow-sm px-4 py-3">
               <div className="flex gap-1">
